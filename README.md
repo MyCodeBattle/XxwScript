@@ -188,9 +188,9 @@ while pending_segments or active_tasks or ready_downloads:
 - 调度器在关键节点通过 `event_callback` 发送事件：
   - `submitted`：任务已提交
   - `split`：区间因超限被拆分
-  - `waiting_task`：进入等待文件生成状态；若后续还有待提交区间且 181 秒导出间隔未结束，会附带导出间隔剩余秒数
-  - `task_polled`：轮询结果；任务未完成时若导出间隔仍未结束，也会附带导出间隔剩余秒数
-  - `waiting_export_gap`：等待导出间隔，用于按秒刷新 181 秒倒计时
+  - `waiting_task`：进入等待文件生成状态
+  - `task_polled`：轮询结果
+  - `waiting_export_gap`：等待导出间隔；当前仅保留为内部调度事件，不再显示为终端倒计时文案
   - `downloaded`：文件已下载
   - `failed`：任何环节出错
 
@@ -257,7 +257,7 @@ while pending_segments or active_tasks or ready_downloads:
   - 每下载一个区间，增加该区间的秒数
 - **状态文本**：实时显示当前动作，例如：
   - `splitting 2026-04-29 00:00:00..2026-04-30 23:59:59`
-  - 交互式终端（TTY）：`submitted 2026-05-05 12:46:49..2026-05-05 23:59:59 task=3817396224571605464 | 等待文件生成 | 导出间隔 181s`
+  - 交互式终端（TTY）：`submitted 2026-05-05 12:46:49..2026-05-05 23:59:59 task=3817396224571605464 | 等待文件生成`
   - 非交互式终端 / `TERM=dumb`：`submitted 2026-05-05 12:46:49..2026-05-05 23:59:59 task=3817396224571605464`
   - `downloaded 2026-04-29 00:00:00..2026-04-29 11:59:59`
 - **事件日志**：

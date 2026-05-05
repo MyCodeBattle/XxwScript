@@ -120,19 +120,19 @@ class TimeProgressBar:
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = True
             self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
-            return self._compose_task_status(include_export_gap=self._live_updates)
+            return self._compose_task_status(include_export_gap=False)
         if event_name == "task_polled":
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = True
             self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
-            return self._compose_task_status(include_export_gap=self._live_updates)
+            return self._compose_task_status(include_export_gap=False)
         if event_name == "waiting_export_gap":
             if not self._live_updates:
                 return self.status
             self._current_export_gap_remaining = payload["remaining_seconds"]
             if self._is_waiting_for_generation and self._current_task_status is not None:
-                return self._compose_task_status()
-            return f"等待导出请求间隔 {payload['remaining_seconds']}s"
+                return self._compose_task_status(include_export_gap=False)
+            return self.status
         if event_name == "downloaded":
             self._is_waiting_for_generation = False
             self._current_export_gap_remaining = None
