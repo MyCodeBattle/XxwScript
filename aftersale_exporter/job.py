@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from aftersale_exporter.merge import merge_tabular_exports
+from aftersale_exporter.merge import MergeSummary, merge_tabular_exports
 from aftersale_exporter.workflow import ExportCoordinator, ExportRunResult
 
 
@@ -187,6 +187,7 @@ class AftersaleExportJob:
         )
         result: ExportRunResult | None = None
         merge_error: str | None = None
+        merge_summary: MergeSummary | None = None
 
         try:
             try:
@@ -196,9 +197,10 @@ class AftersaleExportJob:
                 raise
 
             try:
-                merge_tabular_exports(
+                merge_summary = merge_tabular_exports(
                     [segment.file_path for segment in result.segments],
                     self.out_dir / "merged.xlsx",
+                    timezone_name=self.timezone_name,
                 )
             except ValueError as exc:
                 merge_error = str(exc)
@@ -211,6 +213,9 @@ class AftersaleExportJob:
             except Exception:
                 tracker.finalize(result, merge_error=merge_error)
                 raise
+
+            if merge_summary is not None:
+                self._print_merge_comparison(tracker.daily_counts, merge_summary)
 
             tracker.finalize(result, merge_error=merge_error)
         finally:
@@ -253,6 +258,47 @@ class AftersaleExportJob:
                     "total": total,
                 },
             )
+
+    def _print_merge_comparison(
+        self,
+        daily_counts: list[dict[str, Any]],
+        merge_summary: MergeSummary,
+    ) -> None:
+        manifest_by_date = {item["date"]: item for item in daily_counts}
+        all_dates = sorted(set(manifest_by_date) | set(merge_summary.daily_counts))
+        matched_days = 0
+        mismatched_days = 0
+        skipped_days = 0
+
+        for current_date in all_dates:
+            manifest_item = manifest_by_date.get(current_date)
+            merged_total = merge_summary.daily_counts.get(current_date, 0)
+            if manifest_item is not None and manifest_item.get("status") != "counted":
+                skipped_days += 1
+                print(f"{current_date} | manifest=FAILED | merged={merged_total} | SKIPPED")
+                continue
+
+            manifest_total = 0 if manifest_item is None else int(manifest_item["total"])
+            if manifest_total == merged_total:
+                matched_days += 1
+                print(f"{current_date} | manifest={manifest_total} | merged={merged_total} | MATCH")
+                continue
+
+            mismatched_days += 1
+            print(f"{current_date} | manifest={manifest_total} | merged={merged_total} | MISMATCH")
+
+        print(
+            "去重汇总 | "
+            f"total={merge_summary.total_rows} | "
+            f"unique={merge_summary.unique_rows} | "
+            f"duplicates={merge_summary.duplicate_rows}"
+        )
+        print(
+            "比对汇总 | "
+            f"match={matched_days} | "
+            f"mismatch={mismatched_days} | "
+            f"skipped={skipped_days}"
+        )
 
 
 def _iter_daily_ranges(

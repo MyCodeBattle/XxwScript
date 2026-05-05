@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from datetime import datetime
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -62,19 +64,30 @@ class MixedFormatFakeService:
 
     def download_export(self, task_id: str, destination: Path) -> Path:
         if destination.suffix == ".csv":
-            destination.write_text("id,left_only\n1,L\n", encoding="utf-8")
+            destination.write_text(
+                "\n".join(
+                    [
+                        "售后单号,售后完结时间,left_only",
+                        "A1,1970-01-01 08:00:00,L1",
+                        "A2,1970-01-01 08:00:03,L2",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             return destination
 
         workbook = Workbook()
         sheet = workbook.active
-        sheet.append(["id", "right_only"])
-        sheet.append([2, "R"])
+        sheet.append(["售后单号", "售后完结时间", "right_only"])
+        sheet.append(["A2", datetime(1970, 1, 1, 8, 0, 3), "R2"])
+        sheet.append(["A3", datetime(1970, 1, 1, 8, 0, 5), "R3"])
         workbook.save(destination)
         return destination
 
     def count_aftersales(self, start_ts: int, end_ts: int) -> int:
         self.count_requests.append((start_ts, end_ts))
-        return len(self.count_requests)
+        return len(self.count_requests) + 1
 
 
 class UnsupportedFormatFakeService:
@@ -129,7 +142,16 @@ class PartialFailureFakeService:
     def download_export(self, task_id: str, destination: Path) -> Path:
         if task_id == "task-2-3":
             raise RuntimeError("disk full")
-        destination.write_text("id,value\n1,ok\n", encoding="utf-8")
+        destination.write_text(
+            "\n".join(
+                [
+                    "售后单号,售后完结时间,value",
+                    "A1,1970-01-01 08:00:00,ok",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         return destination
 
     def count_aftersales(self, start_ts: int, end_ts: int) -> int:
@@ -143,10 +165,14 @@ class DailyCountFakeService(MixedFormatFakeService):
         *,
         count_totals: dict[tuple[int, int], int] | None = None,
         count_failures: dict[tuple[int, int], Exception] | None = None,
+        export_rows: dict[str, list[tuple[str, datetime | str, str]]] | None = None,
     ) -> None:
         super().__init__()
         self.count_totals = count_totals or {}
         self.count_failures = count_failures or {}
+        self.export_rows = export_rows or {
+            "task-default": [("A1", "1970-01-01 08:00:00", "ok")],
+        }
 
     def create_export(self, start_ts: int, end_ts: int) -> str:
         return f"task-{start_ts}-{end_ts}"
@@ -160,7 +186,14 @@ class DailyCountFakeService(MixedFormatFakeService):
         )
 
     def download_export(self, task_id: str, destination: Path) -> Path:
-        destination.write_text("id,value\n1,ok\n", encoding="utf-8")
+        rows = self.export_rows.get(task_id)
+        if rows is None:
+            rows = next(iter(self.export_rows.values()))
+        lines = ["售后单号,售后完结时间,value"]
+        for order_no, finished_at, value in rows:
+            cell = finished_at if isinstance(finished_at, str) else finished_at.strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"{order_no},{cell},{value}")
+        destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return destination
 
     def count_aftersales(self, start_ts: int, end_ts: int) -> int:
@@ -172,7 +205,7 @@ class DailyCountFakeService(MixedFormatFakeService):
 
 
 class AftersaleExportJobTests(unittest.TestCase):
-    def test_job_writes_manifest_and_merged_xlsx_for_split_exports(self) -> None:
+    def test_job_writes_manifest_and_deduplicated_merged_xlsx_for_split_exports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clock = FakeClock()
             job = AftersaleExportJob(
@@ -184,7 +217,9 @@ class AftersaleExportJobTests(unittest.TestCase):
                 time_fn=clock.monotonic,
             )
 
-            result = job.run(start_ts=0, end_ts=3)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = job.run(start_ts=0, end_ts=3)
 
             manifest_path = Path(tmpdir) / "manifest.json"
             merged_path = Path(tmpdir) / "merged.xlsx"
@@ -213,16 +248,25 @@ class AftersaleExportJobTests(unittest.TestCase):
                         "start_ts": 0,
                         "end_ts": 3,
                         "status": "counted",
-                        "total": 1,
+                        "total": 2,
                     }
                 ],
             )
 
             workbook = load_workbook(merged_path)
             rows = list(workbook.active.iter_rows(values_only=True))
-            self.assertEqual(rows[0], ("id", "left_only", "right_only"))
-            self.assertEqual(rows[1], ("1", "L", None))
-            self.assertEqual(rows[2], (2, None, "R"))
+            self.assertEqual(rows[0], ("售后单号", "售后完结时间", "left_only", "right_only"))
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(rows[1][0], "A1")
+            self.assertEqual(rows[2][0], "A2")
+            self.assertEqual(rows[2][2], "L2")
+            self.assertIsNone(rows[2][3])
+            self.assertEqual(rows[3][0], "A3")
+
+            output = stdout.getvalue()
+            self.assertIn("1970-01-01 | manifest=2 | merged=3 | MISMATCH", output)
+            self.assertIn("去重汇总 | total=4 | unique=3 | duplicates=1", output)
+            self.assertIn("比对汇总 | match=0 | mismatch=1 | skipped=0", output)
 
     def test_job_keeps_raw_files_and_records_merge_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -314,7 +358,14 @@ class AftersaleExportJobTests(unittest.TestCase):
                     (first_start, first_end): 11,
                     (second_start, second_end): 22,
                     (third_start, third_end): 33,
-                }
+                },
+                export_rows={
+                    f"task-{first_start}-{third_end}": [
+                        ("A1", "2026-05-01 12:00:00", "v1"),
+                        ("A2", "2026-05-02 12:00:00", "v2"),
+                        ("A3", "2026-05-03 10:00:00", "v3"),
+                    ]
+                },
             )
             job = AftersaleExportJob(
                 service=service,
@@ -326,7 +377,9 @@ class AftersaleExportJobTests(unittest.TestCase):
                 timezone_name="Asia/Shanghai",
             )
 
-            job.run(start_ts=first_start, end_ts=third_end)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                job.run(start_ts=first_start, end_ts=third_end)
 
             manifest = json.loads(
                 (Path(tmpdir) / "manifest.json").read_text(encoding="utf-8")
@@ -368,17 +421,24 @@ class AftersaleExportJobTests(unittest.TestCase):
                 },
             ],
         )
+        output = stdout.getvalue()
+        self.assertIn("2026-05-01 | manifest=11 | merged=1 | MISMATCH", output)
+        self.assertIn("2026-05-02 | manifest=22 | merged=1 | MISMATCH", output)
+        self.assertIn("2026-05-03 | manifest=33 | merged=1 | MISMATCH", output)
 
-    def test_job_records_partial_daily_count_failures_without_failing_export(self) -> None:
+    def test_job_prints_match_results_for_consistent_daily_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clock = FakeClock()
-            first_start = local_ts("2026-05-01 08:00:00")
-            first_end = local_ts("2026-05-01 23:59:59")
-            second_start = local_ts("2026-05-02 00:00:00")
-            second_end = local_ts("2026-05-02 08:00:00")
+            start_ts = local_ts("2026-05-01 00:00:00")
+            end_ts = local_ts("2026-05-01 23:59:59")
             service = DailyCountFakeService(
-                count_totals={(first_start, first_end): 7},
-                count_failures={(second_start, second_end): RuntimeError("count failed")},
+                count_totals={(start_ts, end_ts): 2},
+                export_rows={
+                    f"task-{start_ts}-{end_ts}": [
+                        ("A1", "2026-05-01 09:00:00", "v1"),
+                        ("A2", "2026-05-01 10:00:00", "v2"),
+                    ]
+                },
             )
             job = AftersaleExportJob(
                 service=service,
@@ -390,7 +450,44 @@ class AftersaleExportJobTests(unittest.TestCase):
                 timezone_name="Asia/Shanghai",
             )
 
-            result = job.run(start_ts=first_start, end_ts=second_end)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                job.run(start_ts=start_ts, end_ts=end_ts)
+
+        output = stdout.getvalue()
+        self.assertIn("2026-05-01 | manifest=2 | merged=2 | MATCH", output)
+        self.assertIn("比对汇总 | match=1 | mismatch=0 | skipped=0", output)
+
+    def test_job_records_partial_daily_count_failures_without_failing_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            first_start = local_ts("2026-05-01 08:00:00")
+            first_end = local_ts("2026-05-01 23:59:59")
+            second_start = local_ts("2026-05-02 00:00:00")
+            second_end = local_ts("2026-05-02 08:00:00")
+            service = DailyCountFakeService(
+                count_totals={(first_start, first_end): 7},
+                count_failures={(second_start, second_end): RuntimeError("count failed")},
+                export_rows={
+                    f"task-{first_start}-{second_end}": [
+                        ("A1", "2026-05-01 12:00:00", "v1"),
+                        ("A2", "2026-05-02 02:00:00", "v2"),
+                    ]
+                },
+            )
+            job = AftersaleExportJob(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+                timezone_name="Asia/Shanghai",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = job.run(start_ts=first_start, end_ts=second_end)
 
             manifest = json.loads(
                 (Path(tmpdir) / "manifest.json").read_text(encoding="utf-8")
@@ -405,6 +502,7 @@ class AftersaleExportJobTests(unittest.TestCase):
         self.assertEqual(manifest["daily_counts"][1]["status"], "failed")
         self.assertEqual(manifest["daily_counts"][1]["error_type"], "RuntimeError")
         self.assertEqual(manifest["daily_counts"][1]["message"], "count failed")
+        self.assertIn("2026-05-02 | manifest=FAILED | merged=1 | SKIPPED", stdout.getvalue())
 
 
 if __name__ == "__main__":
