@@ -17,6 +17,9 @@ dev = [
   "pytest>=8.3.5",
 ]
 
+[project.scripts]
+aftersale-exporter = "aftersale_exporter.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["aftersale_exporter*"]
 
