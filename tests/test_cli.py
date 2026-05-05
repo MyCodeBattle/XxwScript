@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 import aftersale_exporter.cli as cli_module
@@ -9,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from aftersale_exporter.cli import main, parse_local_timestamp
+from aftersale_exporter.curl_template import DEFAULT_EXPORT_FILTER_CONFIG
 
 
 SEED_CURL = r"""
@@ -23,16 +26,37 @@ curl 'https://fxg.jinritemai.com/ffa/maftersale/aftersale/list?appid=1&__token=a
   -b 'sessionid=abc123'
 """
 
-FILTER_JSON = """
-{
-  "order_by": ["status_deadline asc"],
-  "conf_version": "v13",
-  "after_sale_status": "audit_refunded"
-}
-"""
-
 
 class CliTests(unittest.TestCase):
+    def test_cli_script_runs_directly_without_import_error(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        script_path = repo_root / "aftersale_exporter" / "cli.py"
+
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--help"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Export aftersale orders", result.stdout)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+    def test_repo_root_cli_wrapper_runs(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        script_path = repo_root / "cli.py"
+
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--help"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Export aftersale orders", result.stdout)
+
     def test_parse_local_timestamp_defaults_to_shanghai_timezone(self) -> None:
         actual = parse_local_timestamp("2026-04-29 00:00:00", "Asia/Shanghai")
 
@@ -57,13 +81,11 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(actual, expected)
 
-    def test_main_builds_service_from_seed_curl_and_filter_json(self) -> None:
+    def test_main_builds_service_from_seed_curl_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             out_dir = Path(tmpdir) / "out"
             seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             mock_job = MagicMock()
             with patch("aftersale_exporter.cli.AftersaleApiService") as service_cls, patch(
@@ -78,8 +100,6 @@ class CliTests(unittest.TestCase):
                         "2026-04-29 00:00:05",
                         "--seed-curl",
                         str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
                         "--out-dir",
                         str(out_dir),
                     ]
@@ -89,6 +109,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(service_cls.call_count, 1)
         self.assertIn("session_seed", service_cls.call_args.kwargs)
         self.assertIn("filter_config", service_cls.call_args.kwargs)
+        self.assertEqual(
+            service_cls.call_args.kwargs["filter_config"],
+            DEFAULT_EXPORT_FILTER_CONFIG,
+        )
         self.assertEqual(job_cls.call_count, 1)
         self.assertIn("progress_callback", job_cls.call_args.kwargs)
         mock_job.run.assert_called_once_with(
@@ -99,10 +123,8 @@ class CliTests(unittest.TestCase):
     def test_main_accepts_date_only_inputs_and_expands_full_day(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             out_dir = Path(tmpdir) / "out"
             seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             mock_job = MagicMock()
             with patch("aftersale_exporter.cli.AftersaleApiService") as service_cls, patch(
@@ -117,8 +139,6 @@ class CliTests(unittest.TestCase):
                         "2026-04-30",
                         "--seed-curl",
                         str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
                         "--out-dir",
                         str(out_dir),
                     ]
@@ -135,10 +155,8 @@ class CliTests(unittest.TestCase):
     def test_main_accepts_mixed_date_only_and_full_timestamp_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             out_dir = Path(tmpdir) / "out"
             seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             mock_job = MagicMock()
             with patch("aftersale_exporter.cli.AftersaleApiService") as service_cls, patch(
@@ -153,8 +171,6 @@ class CliTests(unittest.TestCase):
                         "2026-04-30 12:00:00",
                         "--seed-curl",
                         str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
                         "--out-dir",
                         str(out_dir),
                     ]
@@ -168,12 +184,42 @@ class CliTests(unittest.TestCase):
             end_ts=parse_local_timestamp("2026-04-30 12:00:00", "Asia/Shanghai"),
         )
 
+    def test_main_uses_project_root_default_seed_curl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            seed_path = Path(tmpdir) / "seed.curl"
+            out_dir = Path(tmpdir) / "out"
+            seed_path.write_text(SEED_CURL, encoding="utf-8")
+
+            mock_job = MagicMock()
+            with patch.object(cli_module, "DEFAULT_SEED_CURL_PATH", seed_path, create=True), patch(
+                "aftersale_exporter.cli.AftersaleApiService"
+            ) as service_cls, patch(
+                "aftersale_exporter.cli.AftersaleExportJob",
+                return_value=mock_job,
+            ) as job_cls:
+                exit_code = main(
+                    [
+                        "--start",
+                        "2026-04-29 00:00:00",
+                        "--end",
+                        "2026-04-29 00:00:05",
+                        "--out-dir",
+                        str(out_dir),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(service_cls.call_count, 1)
+        self.assertEqual(job_cls.call_count, 1)
+        mock_job.run.assert_called_once_with(
+            start_ts=parse_local_timestamp("2026-04-29 00:00:00", "Asia/Shanghai"),
+            end_ts=parse_local_timestamp("2026-04-29 00:00:05", "Asia/Shanghai"),
+        )
+
     def test_main_rejects_start_after_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             with self.assertRaisesRegex(SystemExit, "start time must be earlier than end time"):
                 main(
@@ -184,8 +230,6 @@ class CliTests(unittest.TestCase):
                         "2026-04-29 00:00:00",
                         "--seed-curl",
                         str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
                         "--out-dir",
                         str(Path(tmpdir) / "out"),
                     ]
@@ -194,9 +238,7 @@ class CliTests(unittest.TestCase):
     def test_main_rejects_seed_curl_missing_required_query_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             seed_path.write_text(BAD_SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             with self.assertRaisesRegex(SystemExit, "missing required query fields"):
                 main(
@@ -207,31 +249,6 @@ class CliTests(unittest.TestCase):
                         "2026-04-29 00:00:05",
                         "--seed-curl",
                         str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
-                        "--out-dir",
-                        str(Path(tmpdir) / "out"),
-                    ]
-                )
-
-    def test_main_rejects_invalid_filter_json_shape(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
-            seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text("[]", encoding="utf-8")
-
-            with self.assertRaisesRegex(SystemExit, "non-empty JSON object"):
-                main(
-                    [
-                        "--start",
-                        "2026-04-29 00:00:00",
-                        "--end",
-                        "2026-04-29 00:00:05",
-                        "--seed-curl",
-                        str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
                         "--out-dir",
                         str(Path(tmpdir) / "out"),
                     ]
@@ -244,10 +261,8 @@ class CliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             out_dir = Path(tmpdir) / "out"
             seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             mock_job = MagicMock()
             mock_progress = MagicMock()
@@ -266,15 +281,17 @@ class CliTests(unittest.TestCase):
                         "2026-04-29 00:00:05",
                         "--seed-curl",
                         str(seed_path),
-                        "--filter-json",
-                        str(filter_path),
                         "--out-dir",
                         str(out_dir),
                     ]
                 )
 
         self.assertEqual(exit_code, 0)
-        progress_cls.assert_called_once()
+        progress_cls.assert_called_once_with(
+            start_ts=parse_local_timestamp("2026-04-29 00:00:00", "Asia/Shanghai"),
+            end_ts=parse_local_timestamp("2026-04-29 00:00:05", "Asia/Shanghai"),
+            timezone_name="Asia/Shanghai",
+        )
         self.assertEqual(job_cls.call_args.kwargs["progress_callback"], mock_progress.handle_event)
         mock_progress.finish.assert_called_once_with(success=True)
 
@@ -285,10 +302,8 @@ class CliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             seed_path = Path(tmpdir) / "seed.curl"
-            filter_path = Path(tmpdir) / "filter.json"
             out_dir = Path(tmpdir) / "out"
             seed_path.write_text(SEED_CURL, encoding="utf-8")
-            filter_path.write_text(FILTER_JSON, encoding="utf-8")
 
             mock_job = MagicMock()
             mock_job.run.side_effect = RuntimeError("boom")
@@ -309,8 +324,6 @@ class CliTests(unittest.TestCase):
                             "2026-04-29 00:00:05",
                             "--seed-curl",
                             str(seed_path),
-                            "--filter-json",
-                            str(filter_path),
                             "--out-dir",
                             str(out_dir),
                         ]

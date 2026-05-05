@@ -4,9 +4,9 @@ import json
 import unittest
 
 from aftersale_exporter.curl_template import (
+    DEFAULT_EXPORT_FILTER_CONFIG,
     ExportFilterConfig,
     SessionSeed,
-    load_filter_config,
     parse_seed_curl,
 )
 
@@ -19,16 +19,6 @@ curl 'https://fxg.jinritemai.com/ffa/maftersale/aftersale/list?appid=1&__token=a
   -H 'x-secsdk-csrf-token: csrf-token' \
   -b 'ttwid=ttwid-value'
 """
-
-FILTER_JSON = """
-{
-  "order_by": ["status_deadline asc"],
-  "conf_version": "v13",
-  "after_sale_status": "audit_refunded",
-  "order_flag": []
-}
-"""
-
 
 class SeedCurlTests(unittest.TestCase):
     def test_parse_seed_curl_extracts_whitelisted_query_and_normalized_cookies(self) -> None:
@@ -75,10 +65,9 @@ class SeedCurlTests(unittest.TestCase):
 
     def test_build_requests_use_fixed_endpoint_paths_and_runtime_lid(self) -> None:
         seed = parse_seed_curl(SEED_CURL)
-        filter_config = load_filter_config(FILTER_JSON)
 
         export_request = seed.build_export_request(
-            filter_config=filter_config,
+            filter_config=DEFAULT_EXPORT_FILTER_CONFIG,
             start_ts=111,
             end_ts=222,
             request_lid="newlid",
@@ -113,13 +102,27 @@ class SeedCurlTests(unittest.TestCase):
         self.assertEqual(export_request.json["apply_time_end"], 222)
         self.assertEqual(export_request.json["_lid"], "newlid")
         self.assertEqual(export_request.json["after_sale_status"], "audit_refunded")
+        self.assertEqual(export_request.json["search_receiver"], "")
+        self.assertEqual(export_request.json["after_sale_type"], "")
+        self.assertEqual(export_request.json["reason"], "")
+        self.assertEqual(export_request.json["negotiate_status"], "")
+        self.assertEqual(export_request.json["order_logistics_state"], [])
 
-    def test_filter_config_requires_non_empty_object(self) -> None:
-        with self.assertRaisesRegex(ValueError, "non-empty JSON object"):
-            load_filter_config("[]")
-
-        with self.assertRaisesRegex(ValueError, "non-empty JSON object"):
-            load_filter_config("{}")
+    def test_default_filter_config_contains_full_hardcoded_body(self) -> None:
+        self.assertEqual(
+            DEFAULT_EXPORT_FILTER_CONFIG.body,
+            {
+                "order_by": ["status_deadline asc"],
+                "conf_version": "v13",
+                "search_receiver": "",
+                "after_sale_status": "audit_refunded",
+                "after_sale_type": "",
+                "reason": "",
+                "negotiate_status": "",
+                "order_flag": [],
+                "order_logistics_state": [],
+            },
+        )
 
     def test_session_seed_round_trip_preserves_json_serializability(self) -> None:
         encoded = json.dumps(SessionSeed.model_dump(parse_seed_curl(SEED_CURL)), sort_keys=True)
@@ -128,7 +131,7 @@ class SeedCurlTests(unittest.TestCase):
         self.assertIn('"sessionid": "abc123"', encoded)
 
     def test_filter_config_round_trip_preserves_body(self) -> None:
-        encoded = json.dumps(ExportFilterConfig.model_dump(load_filter_config(FILTER_JSON)), sort_keys=True)
+        encoded = json.dumps(ExportFilterConfig.model_dump(DEFAULT_EXPORT_FILTER_CONFIG), sort_keys=True)
 
         self.assertIn('"after_sale_status": "audit_refunded"', encoded)
 

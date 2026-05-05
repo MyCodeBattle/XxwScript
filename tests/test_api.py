@@ -5,8 +5,8 @@ import tempfile
 import unittest
 
 from aftersale_exporter.api import AftersaleApiService, RequestFailedError, TaskTimeoutError
-from aftersale_exporter.curl_template import load_filter_config, parse_seed_curl
-from aftersale_exporter.workflow import AuthenticationError, OverLimitError
+from aftersale_exporter.curl_template import DEFAULT_EXPORT_FILTER_CONFIG, parse_seed_curl
+from aftersale_exporter.workflow import AuthenticationError, OverLimitError, TaskPollResult
 
 
 SEED_CURL = r"""
@@ -14,15 +14,6 @@ curl 'https://fxg.jinritemai.com/ffa/maftersale/aftersale/list?appid=1&__token=a
   -H 'content-type: application/json;charset=UTF-8' \
   -b 'sessionid=abc123'
 """
-
-FILTER_JSON = """
-{
-  "order_by": ["status_deadline asc"],
-  "conf_version": "v13",
-  "after_sale_status": "audit_refunded"
-}
-"""
-
 
 class FakeResponse:
     def __init__(
@@ -59,6 +50,9 @@ class FakeClock:
         self.now = 0.0
         self.sleeps: list[float] = []
 
+    def time(self) -> float:
+        return self.now
+
     def monotonic(self) -> float:
         return self.now
 
@@ -78,11 +72,12 @@ class AftersaleApiServiceTests(unittest.TestCase):
         fake_clock = clock or FakeClock()
         service = AftersaleApiService(
             session_seed=parse_seed_curl(SEED_CURL),
-            filter_config=load_filter_config(FILTER_JSON),
+            filter_config=DEFAULT_EXPORT_FILTER_CONFIG,
             session=session,
             lid_factory=lambda: "generated-lid",
             sleep_fn=fake_clock.sleep,
             monotonic_fn=fake_clock.monotonic,
+            wall_clock_fn=fake_clock.time,
         )
         return service, session
 
@@ -103,6 +98,7 @@ class AftersaleApiServiceTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["json"]["apply_time_start"], 111)
         self.assertEqual(session.calls[0]["json"]["apply_time_end"], 222)
         self.assertEqual(session.calls[0]["json"]["after_sale_status"], "audit_refunded")
+        self.assertEqual(session.calls[0]["json"]["search_receiver"], "")
 
     def test_create_export_detects_platform_limit_error(self) -> None:
         service, _ = self.build_service(
@@ -176,6 +172,147 @@ class AftersaleApiServiceTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["params"]["task_id_list"], "task-1")
         self.assertEqual(session.calls[0]["params"]["_lid"], "generated-lid")
         self.assertEqual(clock.sleeps, [2.0])
+
+    def test_poll_task_returns_incomplete_status_without_filename(self) -> None:
+        clock = FakeClock()
+        service, session = self.build_service(
+            [
+                FakeResponse(
+                    json_data={
+                        "code": 0,
+                        "data": [{"task_id": "task-1", "status": "running"}],
+                    }
+                )
+            ],
+            clock=clock,
+        )
+
+        result = service.poll_task("task-1")
+
+        self.assertEqual(
+            result,
+            TaskPollResult(
+                requested_at_ts=0,
+                result_text="文件未生成",
+                is_complete=False,
+                download_name=None,
+            ),
+        )
+        self.assertEqual(
+            session.calls[0]["url"],
+            "https://fxg.jinritemai.com/shopuser/aftersale/export/tasks",
+        )
+        self.assertEqual(session.calls[0]["params"]["task_id_list"], "task-1")
+
+    def test_poll_task_returns_completed_status_with_filename(self) -> None:
+        clock = FakeClock()
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    json_data={
+                        "code": 0,
+                        "data": [
+                            {
+                                "task_id": "task-1",
+                                "status": "success",
+                                "file_name": "done.csv",
+                            }
+                        ],
+                    }
+                )
+            ],
+            clock=clock,
+        )
+
+        result = service.poll_task("task-1")
+
+        self.assertEqual(
+            result,
+            TaskPollResult(
+                requested_at_ts=0,
+                result_text="文件已生成",
+                is_complete=True,
+                download_name="done.csv",
+            ),
+        )
+
+    def test_wait_for_task_reports_incomplete_poll_status_before_completion(self) -> None:
+        clock = FakeClock()
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    json_data={
+                        "code": 0,
+                        "data": [{"task_id": "task-1", "status": "running"}],
+                    }
+                ),
+                FakeResponse(
+                    json_data={
+                        "code": 0,
+                        "data": [
+                            {
+                                "task_id": "task-1",
+                                "status": "success",
+                                "file_name": "done.csv",
+                            }
+                        ],
+                    }
+                ),
+            ],
+            clock=clock,
+        )
+        statuses: list[dict[str, object]] = []
+
+        result = service.wait_for_task(
+            "task-1",
+            poll_interval=2.0,
+            timeout=5.0,
+            status_callback=lambda payload: statuses.append(payload),
+        )
+
+        self.assertEqual(result.download_name, "done.csv")
+        self.assertEqual(
+            statuses,
+            [
+                {"requested_at_ts": 0, "result_text": "文件未生成"},
+                {"requested_at_ts": 2, "result_text": "文件已生成"},
+            ],
+        )
+
+    def test_wait_for_task_reports_completed_poll_status_without_sleep(self) -> None:
+        clock = FakeClock()
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    json_data={
+                        "code": 0,
+                        "data": [
+                            {
+                                "task_id": "task-1",
+                                "status": "success",
+                                "file_name": "done.csv",
+                            }
+                        ],
+                    }
+                ),
+            ],
+            clock=clock,
+        )
+        statuses: list[dict[str, object]] = []
+
+        result = service.wait_for_task(
+            "task-1",
+            poll_interval=2.0,
+            timeout=5.0,
+            status_callback=lambda payload: statuses.append(payload),
+        )
+
+        self.assertEqual(result.download_name, "done.csv")
+        self.assertEqual(
+            statuses,
+            [{"requested_at_ts": 0, "result_text": "文件已生成"}],
+        )
+        self.assertEqual(clock.sleeps, [])
 
     def test_wait_for_task_accepts_task_list_payload_with_numeric_status(self) -> None:
         service, session = self.build_service(
@@ -275,6 +412,92 @@ class AftersaleApiServiceTests(unittest.TestCase):
             final_path = service.download_export("task-1", destination)
 
             self.assertEqual(final_path.name, "test-export.xlsx")
+            self.assertEqual(final_path.read_bytes(), b"xlsx-bytes")
+
+    def test_download_export_repairs_mojibake_filename_from_content_disposition(self) -> None:
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    content=b"xlsx-bytes",
+                    headers={
+                        "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "content-disposition": (
+                            "attachment; "
+                            "filename=å®ååå¯¼åº-2026-05-05-08-44-27.xlsx"
+                        ),
+                    },
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = Path(tmpdir) / "task-1.bin"
+            final_path = service.download_export("task-1", destination)
+
+            self.assertEqual(final_path.name, "售后单导出-2026-05-05-08-44-27.xlsx")
+            self.assertEqual(final_path.read_bytes(), b"xlsx-bytes")
+
+    def test_download_export_prefers_rfc5987_filename_star(self) -> None:
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    content=b"xlsx-bytes",
+                    headers={
+                        "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "content-disposition": (
+                            "attachment; "
+                            "filename=export.xlsx; "
+                            "filename*=UTF-8''%E5%94%AE%E5%90%8E%E5%8D%95%E5%AF%BC%E5%87%BA.xlsx"
+                        ),
+                    },
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = Path(tmpdir) / "task-1.bin"
+            final_path = service.download_export("task-1", destination)
+
+            self.assertEqual(final_path.name, "售后单导出.xlsx")
+            self.assertEqual(final_path.read_bytes(), b"xlsx-bytes")
+
+    def test_download_export_preserves_non_utf8_filename_value(self) -> None:
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    content=b"xlsx-bytes",
+                    headers={
+                        "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "content-disposition": 'attachment; filename="résumé.xlsx"',
+                    },
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = Path(tmpdir) / "task-1.bin"
+            final_path = service.download_export("task-1", destination)
+
+            self.assertEqual(final_path.name, "résumé.xlsx")
+            self.assertEqual(final_path.read_bytes(), b"xlsx-bytes")
+
+    def test_download_export_infers_xlsx_suffix_from_content_type_without_filename(self) -> None:
+        service, _ = self.build_service(
+            [
+                FakeResponse(
+                    content=b"xlsx-bytes",
+                    headers={
+                        "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    },
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = Path(tmpdir) / "task-1.bin"
+            final_path = service.download_export("task-1", destination)
+
+            self.assertEqual(final_path.name, "task-1.xlsx")
             self.assertEqual(final_path.read_bytes(), b"xlsx-bytes")
 
 

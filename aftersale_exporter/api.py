@@ -4,11 +4,22 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 from typing import Any, Callable
+from urllib.parse import unquote_to_bytes
 
 import requests
 
-from aftersale_exporter.curl_template import ExportFilterConfig, HttpRequest, SessionSeed
-from aftersale_exporter.workflow import AuthenticationError, OverLimitError, TaskResult
+from aftersale_exporter.curl_template import (
+    DEFAULT_EXPORT_FILTER_CONFIG,
+    ExportFilterConfig,
+    HttpRequest,
+    SessionSeed,
+)
+from aftersale_exporter.workflow import (
+    AuthenticationError,
+    OverLimitError,
+    TaskPollResult,
+    TaskResult,
+)
 
 
 class RequestFailedError(Exception):
@@ -22,11 +33,12 @@ class TaskTimeoutError(RequestFailedError):
 @dataclass
 class AftersaleApiService:
     session_seed: SessionSeed
-    filter_config: ExportFilterConfig
+    filter_config: ExportFilterConfig = DEFAULT_EXPORT_FILTER_CONFIG
     session: Any | None = None
     lid_factory: Callable[[], str] | None = None
     sleep_fn: Callable[[float], None] = time.sleep
     monotonic_fn: Callable[[], float] = time.monotonic
+    wall_clock_fn: Callable[[], float] = time.time
     max_retries: int = 3
 
     def __post_init__(self) -> None:
@@ -45,20 +57,43 @@ class AftersaleApiService:
         payload = self._send_json(request)
         return _extract_task_id(payload)
 
-    def wait_for_task(self, task_id: str, poll_interval: float, timeout: float) -> TaskResult:
+    def wait_for_task(
+        self,
+        task_id: str,
+        poll_interval: float,
+        timeout: float,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> TaskResult:
         deadline = self.monotonic_fn() + timeout
         while True:
-            request = self.session_seed.build_tasks_request(
-                task_ids=[task_id],
-                request_lid=self.lid_factory(),
-            )
-            payload = self._send_json(request)
-            task = _extract_task(payload, task_id)
-            if _is_task_complete(task):
-                return TaskResult(download_name=_extract_download_name(task, task_id))
+            poll_result = self.poll_task(task_id)
+            if status_callback is not None:
+                status_callback(
+                    {
+                        "requested_at_ts": poll_result.requested_at_ts,
+                        "result_text": poll_result.result_text,
+                    }
+                )
+            if poll_result.is_complete:
+                return TaskResult(download_name=poll_result.download_name or f"{task_id}.bin")
             if self.monotonic_fn() + poll_interval > deadline:
                 raise TaskTimeoutError(f"task {task_id} did not finish before timeout")
             self.sleep_fn(poll_interval)
+
+    def poll_task(self, task_id: str) -> TaskPollResult:
+        request = self.session_seed.build_tasks_request(
+            task_ids=[task_id],
+            request_lid=self.lid_factory(),
+        )
+        payload = self._send_json(request)
+        task = _extract_task(payload, task_id)
+        is_complete = _is_task_complete(task)
+        return TaskPollResult(
+            requested_at_ts=int(self.wall_clock_fn()),
+            result_text=_build_task_poll_result_text(is_complete),
+            is_complete=is_complete,
+            download_name=_extract_download_name(task, task_id) if is_complete else None,
+        )
 
     def download_export(self, task_id: str, destination) -> Any:
         request = self.session_seed.build_download_request(
@@ -163,6 +198,12 @@ def _extract_download_name(task: dict[str, Any], task_id: str) -> str:
     return f"{task_id}.bin"
 
 
+def _build_task_poll_result_text(is_complete: bool) -> str:
+    if is_complete:
+        return "文件已生成"
+    return "文件未生成"
+
+
 def _resolve_download_destination(destination: Path, headers: dict[str, Any]) -> Path:
     filename = _filename_from_content_disposition(headers.get("content-disposition"))
     if filename:
@@ -179,8 +220,50 @@ def _resolve_download_destination(destination: Path, headers: dict[str, Any]) ->
 def _filename_from_content_disposition(header_value: Any) -> str | None:
     if not header_value:
         return None
+    filename: str | None = None
+    filename_star: str | None = None
     for part in str(header_value).split(";"):
         piece = part.strip()
-        if piece.lower().startswith("filename="):
-            return piece.split("=", 1)[1].strip().strip('"')
-    return None
+        if "=" not in piece:
+            continue
+        key, value = piece.split("=", 1)
+        normalized_key = key.strip().lower()
+        if normalized_key == "filename*":
+            filename_star = _decode_rfc5987_filename(value)
+        elif normalized_key == "filename":
+            filename = _repair_mojibake_filename(_strip_header_value_quotes(value.strip()))
+    return filename_star or filename
+
+
+def _decode_rfc5987_filename(value: str) -> str | None:
+    candidate = _strip_header_value_quotes(value.strip())
+    if not candidate:
+        return None
+
+    charset = "utf-8"
+    encoded_value = candidate
+    if candidate.count("'") >= 2:
+        charset, _, encoded_value = candidate.split("'", 2)
+        if not charset:
+            charset = "utf-8"
+
+    try:
+        return unquote_to_bytes(encoded_value).decode(charset)
+    except (LookupError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _repair_mojibake_filename(value: str) -> str:
+    if not value:
+        return value
+    try:
+        repaired = value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    return repaired
+
+
+def _strip_header_value_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 from aftersale_exporter.merge import merge_tabular_exports
@@ -103,12 +104,16 @@ class AftersaleExportJob:
         poll_interval: float,
         task_timeout: float,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        sleep_fn: Callable[[float], None] | None = None,
+        time_fn: Callable[[], float] | None = None,
     ) -> None:
         self.service = service
         self.out_dir = out_dir
         self.poll_interval = poll_interval
         self.task_timeout = task_timeout
         self.progress_callback = progress_callback
+        self.sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+        self.time_fn = time.monotonic if time_fn is None else time_fn
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self, start_ts: int, end_ts: int) -> ExportRunResult:
@@ -120,6 +125,8 @@ class AftersaleExportJob:
             poll_interval=self.poll_interval,
             task_timeout=self.task_timeout,
             event_callback=self._emit_event,
+            sleep_fn=self.sleep_fn,
+            time_fn=self.time_fn,
         )
         result: ExportRunResult | None = None
         merge_error: str | None = None

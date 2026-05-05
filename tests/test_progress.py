@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime
 import importlib
 import importlib.util
 import io
 import unittest
+from zoneinfo import ZoneInfo
+
+
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def format_local(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class TimeProgressBarTests(unittest.TestCase):
@@ -23,7 +32,7 @@ class TimeProgressBarTests(unittest.TestCase):
         progress = module.TimeProgressBar(start_ts=10, end_ts=12, stream=output)
 
         self.assertIn("0.0%", output.getvalue())
-        self.assertIn("0/3", output.getvalue())
+        self.assertNotIn("0/3", output.getvalue())
 
         progress.handle_event(
             "downloaded",
@@ -38,8 +47,11 @@ class TimeProgressBarTests(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertIn("100.0%", rendered)
-        self.assertIn("3/3", rendered)
-        self.assertIn("[downloaded] 10..12 -> /tmp/file.csv", rendered)
+        self.assertNotIn("3/3", rendered)
+        self.assertIn(
+            f"[downloaded] {format_local(10)}..{format_local(12)} -> /tmp/file.csv",
+            rendered,
+        )
 
     def test_progress_bar_uses_closed_range_seconds_for_uneven_splits(self) -> None:
         module = self.load_module()
@@ -59,7 +71,7 @@ class TimeProgressBarTests(unittest.TestCase):
             },
         )
         self.assertIn("33.3%", output.getvalue())
-        self.assertIn("2/6", output.getvalue())
+        self.assertNotIn("2/6", output.getvalue())
 
         progress.handle_event(
             "downloaded",
@@ -74,7 +86,69 @@ class TimeProgressBarTests(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertIn("100.0%", rendered)
-        self.assertIn("6/6", rendered)
+        self.assertNotIn("6/6", rendered)
+
+    def test_progress_bar_shows_latest_polled_request_time_and_result(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
+
+        progress.handle_event(
+            "task_polled",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+                "requested_at_ts": 100,
+                "result_text": "文件未生成",
+            },
+        )
+
+        rendered = output.getvalue()
+        self.assertNotIn("0/4", rendered)
+        self.assertIn(
+            f"等待文件生成 | 最近请求 {format_local(100)} | 结果：文件未生成",
+            rendered,
+        )
+        self.assertNotIn("[task_polled]", rendered)
+
+    def test_progress_bar_updates_export_gap_countdown_without_extra_event_logs(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=0, end_ts=3, stream=output)
+
+        progress.handle_event(
+            "waiting_export_gap",
+            {
+                "start_ts": 2,
+                "end_ts": 3,
+                "task_id": "task-2-3",
+                "total_seconds": 181,
+                "remaining_seconds": 181,
+            },
+        )
+        progress.handle_event(
+            "waiting_export_gap",
+            {
+                "start_ts": 2,
+                "end_ts": 3,
+                "task_id": "task-2-3",
+                "total_seconds": 181,
+                "remaining_seconds": 180,
+            },
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("等待导出请求间隔 181s", rendered)
+        self.assertIn("等待导出请求间隔 180s", rendered)
+        self.assertNotIn("0/4", rendered)
+        self.assertNotIn("[waiting_export_gap]", rendered)
 
     def test_progress_bar_keeps_completed_ratio_when_a_later_segment_fails(self) -> None:
         module = self.load_module()
@@ -107,8 +181,11 @@ class TimeProgressBarTests(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertIn("50.0%", rendered)
-        self.assertIn("2/4", rendered)
-        self.assertIn("[failed] 2..3 RuntimeError: disk full", rendered)
+        self.assertNotIn("2/4", rendered)
+        self.assertIn(
+            f"[failed] {format_local(2)}..{format_local(3)} RuntimeError: disk full",
+            rendered,
+        )
 
     def test_progress_bar_prints_event_logs_and_ends_with_newline(self) -> None:
         module = self.load_module()
@@ -138,8 +215,14 @@ class TimeProgressBarTests(unittest.TestCase):
         progress.finish(success=True)
 
         rendered = output.getvalue()
-        self.assertIn("[submitted] 8..8 task=task-8-8", rendered)
-        self.assertIn("[downloaded] 8..8 -> /tmp/export.csv", rendered)
+        self.assertIn(
+            f"[submitted] {format_local(8)}..{format_local(8)} task=task-8-8",
+            rendered,
+        )
+        self.assertIn(
+            f"[downloaded] {format_local(8)}..{format_local(8)} -> /tmp/export.csv",
+            rendered,
+        )
         self.assertTrue(rendered.endswith("\n"))
 
 

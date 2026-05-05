@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json
 import shlex
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -22,6 +21,17 @@ QUERY_WHITELIST = (
     "verifyFp",
     "fp",
 )
+DEFAULT_EXPORT_FILTER_BODY: dict[str, Any] = {
+    "order_by": ["status_deadline asc"],
+    "conf_version": "v13",
+    "search_receiver": "",
+    "after_sale_status": "audit_refunded",
+    "after_sale_type": "",
+    "reason": "",
+    "negotiate_status": "",
+    "order_flag": [],
+    "order_logistics_state": [],
+}
 
 
 @dataclass(frozen=True)
@@ -48,6 +58,9 @@ class ExportFilterConfig:
         body["apply_time_end"] = end_ts
         body["_lid"] = request_lid
         return body
+
+
+DEFAULT_EXPORT_FILTER_CONFIG = ExportFilterConfig(body=DEFAULT_EXPORT_FILTER_BODY)
 
 
 @dataclass(frozen=True)
@@ -156,14 +169,6 @@ def parse_seed_curl(command: str) -> SessionSeed:
         headers=headers,
         cookies=cookies,
     )
-
-
-def load_filter_config(raw_json: str) -> ExportFilterConfig:
-    data = json.loads(raw_json)
-    if not isinstance(data, dict) or not data:
-        raise ValueError("filter JSON must be a non-empty JSON object")
-    return ExportFilterConfig(body=data)
-
 
 def _split_header(raw_header: str) -> tuple[str, str]:
     name, value = raw_header.split(":", 1)

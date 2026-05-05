@@ -9,6 +9,7 @@ from aftersale_exporter.workflow import (
     AuthenticationError,
     ExportCoordinator,
     OverLimitError,
+    TaskPollResult,
 )
 
 
@@ -23,13 +24,15 @@ class FakeService:
         *,
         over_limit_ranges: set[tuple[int, int]] | None = None,
         auth_failure_ranges: set[tuple[int, int]] | None = None,
-        wait_failure_ranges: set[tuple[int, int]] | None = None,
+        poll_sequences: dict[str, list[TaskPollResult | Exception]] | None = None,
+        download_failure_tasks: set[str] | None = None,
     ) -> None:
         self.over_limit_ranges = over_limit_ranges or set()
         self.auth_failure_ranges = auth_failure_ranges or set()
-        self.wait_failure_ranges = wait_failure_ranges or set()
+        self.poll_sequences = {key: list(value) for key, value in (poll_sequences or {}).items()}
+        self.download_failure_tasks = download_failure_tasks or set()
         self.submissions: list[tuple[int, int]] = []
-        self.waited_tasks: list[str] = []
+        self.polled_tasks: list[str] = []
         self.downloaded_tasks: list[str] = []
 
     def create_export(self, start_ts: int, end_ts: int) -> str:
@@ -41,37 +44,64 @@ class FakeService:
             raise OverLimitError("too many rows")
         return f"task-{start_ts}-{end_ts}"
 
-    def wait_for_task(self, task_id: str, poll_interval: float, timeout: float) -> FakeTaskResult:
-        self.waited_tasks.append(task_id)
-        _, start_ts, end_ts = task_id.split("-", 2)
-        if (int(start_ts), int(end_ts)) in self.wait_failure_ranges:
-            raise RuntimeError("wait failed")
-        return FakeTaskResult(download_name=f"{task_id}.csv")
+    def wait_for_task(
+        self,
+        task_id: str,
+        poll_interval: float,
+        timeout: float,
+        status_callback=None,
+    ) -> FakeTaskResult:
+        raise AssertionError("workflow should use poll_task instead of wait_for_task")
+
+    def poll_task(self, task_id: str) -> TaskPollResult:
+        self.polled_tasks.append(task_id)
+        sequence = self.poll_sequences.get(task_id)
+        if sequence:
+            item = sequence.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return TaskPollResult(
+            requested_at_ts=1234567890,
+            result_text="文件已生成",
+            is_complete=True,
+            download_name=f"{task_id}.csv",
+        )
 
     def download_export(self, task_id: str, destination: Path) -> Path:
         self.downloaded_tasks.append(task_id)
+        if task_id in self.download_failure_tasks:
+            raise RuntimeError("disk full")
         destination.write_text("id,value\n1,ok\n", encoding="utf-8")
         return destination
 
 
 class FakeClock:
     def __init__(self) -> None:
+        self.now = 0.0
         self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
 
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
+        self.now += seconds
 
 
 class ExportCoordinatorTests(unittest.TestCase):
     def test_single_interval_runs_without_split_when_under_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clock = FakeClock()
+            events: list[tuple[str, dict[str, object]]] = []
             coordinator = ExportCoordinator(
                 service=FakeService(),
                 out_dir=Path(tmpdir),
                 poll_interval=0.01,
                 task_timeout=1.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
                 sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
             )
 
             result = coordinator.run(10, 19)
@@ -83,8 +113,15 @@ class ExportCoordinatorTests(unittest.TestCase):
             [(10, 19)],
         )
         self.assertEqual(clock.sleeps, [])
+        self.assertEqual(
+            [event_name for event_name, _ in events],
+            ["submitted", "waiting_task", "task_polled", "downloaded"],
+        )
+        task_polled_payload = [payload for event_name, payload in events if event_name == "task_polled"][0]
+        self.assertEqual(task_polled_payload["requested_at_ts"], 1234567890)
+        self.assertEqual(task_polled_payload["result_text"], "文件已生成")
 
-    def test_over_limit_interval_is_split_into_closed_second_ranges(self) -> None:
+    def test_over_limit_interval_is_split_and_rate_limited_between_export_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clock = FakeClock()
             service = FakeService(over_limit_ranges={(0, 9)})
@@ -94,6 +131,7 @@ class ExportCoordinatorTests(unittest.TestCase):
                 poll_interval=0.01,
                 task_timeout=1.0,
                 sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
             )
 
             result = coordinator.run(0, 9)
@@ -103,35 +141,151 @@ class ExportCoordinatorTests(unittest.TestCase):
             [(segment.start_ts, segment.end_ts) for segment in result.segments],
             [(0, 4), (5, 9)],
         )
-        self.assertEqual(clock.sleeps, [181])
+        self.assertEqual(sum(clock.sleeps), 362.0)
 
-    def test_multiple_successful_downloads_sleep_between_each_pair(self) -> None:
+    def test_waiting_generation_time_counts_toward_next_export_request_gap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clock = FakeClock()
-            service = FakeService(over_limit_ranges={(0, 5), (0, 2)})
+            service = FakeService(
+                over_limit_ranges={(0, 3)},
+                poll_sequences={
+                    "task-0-1": [
+                        TaskPollResult(
+                            requested_at_ts=1,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=201,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-0-1.csv",
+                        ),
+                    ],
+                    "task-2-3": [
+                        TaskPollResult(
+                            requested_at_ts=202,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-2-3.csv",
+                        )
+                    ],
+                },
+            )
+            events: list[tuple[str, dict[str, object]]] = []
             coordinator = ExportCoordinator(
                 service=service,
                 out_dir=Path(tmpdir),
-                poll_interval=0.01,
-                task_timeout=1.0,
+                poll_interval=200.0,
+                task_timeout=1000.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
                 sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            result = coordinator.run(0, 3)
+
+        self.assertEqual(result.segment_count, 2)
+        self.assertEqual(service.submissions, [(0, 3), (0, 1), (2, 3)])
+        self.assertEqual(
+            [event_name for event_name, _ in events].count("waiting_export_gap"),
+            362,
+        )
+        self.assertEqual(clock.sleeps.count(1.0), 362)
+        self.assertEqual(service.polled_tasks, ["task-0-1", "task-2-3", "task-0-1"])
+
+    def test_multiple_waiting_tasks_are_polled_and_first_completed_downloads_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(
+                over_limit_ranges={(0, 5)},
+                poll_sequences={
+                    "task-0-2": [
+                        TaskPollResult(
+                            requested_at_ts=181,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=281,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=381,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-0-2.csv",
+                        ),
+                    ],
+                    "task-3-5": [
+                        TaskPollResult(
+                            requested_at_ts=362,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-3-5.csv",
+                        )
+                    ],
+                },
+            )
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=100.0,
+                task_timeout=1000.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
             )
 
             result = coordinator.run(0, 5)
 
         self.assertEqual(
             [(segment.start_ts, segment.end_ts) for segment in result.segments],
-            [(0, 1), (2, 2), (3, 5)],
+            [(0, 2), (3, 5)],
         )
-        self.assertEqual(clock.sleeps, [181, 181])
+        self.assertEqual(service.submissions, [(0, 5), (0, 2), (3, 5)])
+        self.assertEqual(service.polled_tasks, ["task-0-2", "task-0-2", "task-3-5", "task-0-2"])
+        self.assertEqual(service.downloaded_tasks, ["task-3-5", "task-0-2"])
+
+    def test_poll_failure_is_recorded_after_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(
+                poll_sequences={"task-2-3": [RuntimeError("poll failed")]},
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "poll failed"):
+                coordinator.run(2, 3)
+
+        self.assertEqual(
+            [event_name for event_name, _ in events],
+            ["submitted", "waiting_task", "failed"],
+        )
+        self.assertEqual(service.downloaded_tasks, [])
 
     def test_single_second_interval_still_over_limit_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
             coordinator = ExportCoordinator(
                 service=FakeService(over_limit_ranges={(42, 42)}),
                 out_dir=Path(tmpdir),
                 poll_interval=0.01,
                 task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
             )
 
             with self.assertRaisesRegex(OverLimitError, "single second"):
@@ -139,39 +293,21 @@ class ExportCoordinatorTests(unittest.TestCase):
 
     def test_authentication_failure_stops_without_splitting(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
             service = FakeService(auth_failure_ranges={(100, 101)})
             coordinator = ExportCoordinator(
                 service=service,
                 out_dir=Path(tmpdir),
                 poll_interval=0.01,
                 task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
             )
 
             with self.assertRaisesRegex(AuthenticationError, "expired"):
                 coordinator.run(100, 101)
 
         self.assertEqual(service.submissions, [(100, 101)])
-
-    def test_failed_followup_branch_does_not_sleep_before_nonexistent_download(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            clock = FakeClock()
-            service = FakeService(
-                over_limit_ranges={(0, 3)},
-                wait_failure_ranges={(2, 3)},
-            )
-            coordinator = ExportCoordinator(
-                service=service,
-                out_dir=Path(tmpdir),
-                poll_interval=0.01,
-                task_timeout=1.0,
-                sleep_fn=clock.sleep,
-            )
-
-            with self.assertRaisesRegex(RuntimeError, "wait failed"):
-                coordinator.run(0, 3)
-
-        self.assertEqual(service.downloaded_tasks, ["task-0-1"])
-        self.assertEqual(clock.sleeps, [])
 
 
 if __name__ == "__main__":
