@@ -29,3 +29,11 @@ env/
 # Environment
 .env
 .env.local
+
+# Sensitive credentials
+seed.curl
+
+# Runtime artifacts
+manifest.json
+merged.xlsx
+raw/
