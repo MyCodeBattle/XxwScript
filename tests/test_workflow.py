@@ -8,6 +8,7 @@ import unittest
 from aftersale_exporter.workflow import (
     AuthenticationError,
     ExportCoordinator,
+    ExportCooldownError,
     OverLimitError,
     TaskPollResult,
 )
@@ -24,11 +25,13 @@ class FakeService:
         *,
         over_limit_ranges: set[tuple[int, int]] | None = None,
         auth_failure_ranges: set[tuple[int, int]] | None = None,
+        cooldown_failures: dict[tuple[int, int], int] | None = None,
         poll_sequences: dict[str, list[TaskPollResult | Exception]] | None = None,
         download_failure_tasks: set[str] | None = None,
     ) -> None:
         self.over_limit_ranges = over_limit_ranges or set()
         self.auth_failure_ranges = auth_failure_ranges or set()
+        self.cooldown_failures = dict(cooldown_failures or {})
         self.poll_sequences = {key: list(value) for key, value in (poll_sequences or {}).items()}
         self.download_failure_tasks = download_failure_tasks or set()
         self.submissions: list[tuple[int, int]] = []
@@ -40,6 +43,10 @@ class FakeService:
         self.submissions.append(key)
         if key in self.auth_failure_ranges:
             raise AuthenticationError("expired")
+        remaining_cooldown_failures = self.cooldown_failures.get(key, 0)
+        if remaining_cooldown_failures > 0:
+            self.cooldown_failures[key] = remaining_cooldown_failures - 1
+            raise ExportCooldownError("店铺3分钟内不允许再次导出，请稍后再试", retry_after_seconds=181)
         if key in self.over_limit_ranges:
             raise OverLimitError("too many rows")
         return f"task-{start_ts}-{end_ts}"
@@ -190,9 +197,10 @@ class ExportCoordinatorTests(unittest.TestCase):
         self.assertEqual(service.submissions, [(0, 3), (0, 1), (2, 3)])
         self.assertEqual(
             [event_name for event_name, _ in events].count("waiting_export_gap"),
-            181,
+            1,
         )
-        self.assertEqual(clock.sleeps.count(1.0), 181)
+        self.assertEqual(clock.sleeps.count(1.0), 0)
+        self.assertEqual(sum(clock.sleeps), 200.0)
         self.assertEqual(service.polled_tasks, ["task-0-1", "task-2-3", "task-0-1"])
 
     def test_waiting_generation_keeps_emitting_export_gap_before_next_poll(self) -> None:
@@ -242,7 +250,7 @@ class ExportCoordinatorTests(unittest.TestCase):
         self.assertEqual(service.polled_tasks, ["task-0-1", "task-0-1", "task-2-3"])
         self.assertEqual(
             [event_name for event_name, _ in events].count("waiting_export_gap"),
-            181,
+            1,
         )
         waiting_task_payload = [payload for event_name, payload in events if event_name == "waiting_task"][0]
         self.assertEqual(waiting_task_payload["export_gap_total_seconds"], 181)
@@ -301,6 +309,82 @@ class ExportCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.segment_count, 2)
         self.assertEqual(service.submission_started_at, [0.0, 0.0, 191.0])
         self.assertEqual(service.submissions, [(0, 3), (0, 1), (2, 3)])
+
+    def test_initial_export_cooldown_waits_and_retries_without_failed_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(cooldown_failures={(10, 19): 1})
+            events: list[tuple[str, dict[str, object]]] = []
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            result = coordinator.run(10, 19)
+
+        self.assertEqual(result.segment_count, 1)
+        self.assertEqual(service.submissions, [(10, 19), (10, 19)])
+        self.assertEqual(clock.sleeps.count(1.0), 0)
+        self.assertEqual(clock.sleeps, [181.0])
+        self.assertNotIn("failed", [event_name for event_name, _ in events])
+        cooldown_payload = [
+            payload for event_name, payload in events if event_name == "waiting_retry_cooldown"
+        ][0]
+        self.assertEqual(cooldown_payload["remaining_seconds"], 181)
+        self.assertEqual(cooldown_payload["message"], "店铺3分钟内不允许再次导出，请稍后再试")
+
+    def test_runtime_export_cooldown_extends_next_submit_time_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(
+                over_limit_ranges={(0, 3)},
+                cooldown_failures={(2, 3): 1},
+                poll_sequences={
+                    "task-0-1": [
+                        TaskPollResult(
+                            requested_at_ts=0,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-0-1.csv",
+                        )
+                    ],
+                    "task-2-3": [
+                        TaskPollResult(
+                            requested_at_ts=362,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-2-3.csv",
+                        )
+                    ],
+                },
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=10.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            result = coordinator.run(0, 3)
+
+        self.assertEqual(result.segment_count, 2)
+        self.assertEqual(service.submissions, [(0, 3), (0, 1), (2, 3), (2, 3)])
+        self.assertEqual(sum(clock.sleeps), 362.0)
+        self.assertEqual(clock.sleeps.count(1.0), 0)
+        retry_events = [payload for event_name, payload in events if event_name == "waiting_retry_cooldown"]
+        self.assertEqual(len(retry_events), 1)
+        self.assertEqual(retry_events[0]["remaining_seconds"], 181)
+        self.assertEqual(retry_events[0]["start_ts"], 2)
+        self.assertEqual(retry_events[0]["end_ts"], 3)
 
     def test_task_timeout_starts_when_task_creation_succeeds(self) -> None:
         class SlowCreateService(FakeService):

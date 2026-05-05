@@ -22,6 +22,14 @@ class AuthenticationError(ExportError):
     """Raised when authentication has expired."""
 
 
+class ExportCooldownError(ExportError):
+    """Raised when the platform requires waiting before the next export."""
+
+    def __init__(self, message: str, *, retry_after_seconds: int) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 @dataclass(frozen=True)
 class TaskResult:
     download_name: str
@@ -114,9 +122,11 @@ class ExportCoordinator:
         self.raw_dir = out_dir / "raw"
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self._last_export_request_at: float | None = None
+        self._export_cooldown_until: float | None = None
 
     def run(self, start_ts: int, end_ts: int) -> ExportRunResult:
         self._last_export_request_at = None
+        self._export_cooldown_until = None
         segments = self._run_scheduler(start_ts, end_ts)
         ordered_segments = sorted(segments, key=lambda item: (item.start_ts, item.end_ts))
         return ExportRunResult(segments=ordered_segments, failed_count=0)
@@ -200,6 +210,20 @@ class ExportCoordinator:
             )
             pending_segments.appendleft(PendingSegment(mid + 1, segment.end_ts))
             pending_segments.appendleft(PendingSegment(segment.start_ts, mid))
+            return None
+        except ExportCooldownError as exc:
+            retry_started_at = self.time_fn()
+            self._export_cooldown_until = retry_started_at + exc.retry_after_seconds
+            pending_segments.appendleft(segment)
+            self._emit(
+                "waiting_retry_cooldown",
+                {
+                    "start_ts": segment.start_ts,
+                    "end_ts": segment.end_ts,
+                    "remaining_seconds": exc.retry_after_seconds,
+                    "message": str(exc),
+                },
+            )
             return None
         except Exception as exc:
             self._emit(
@@ -324,9 +348,15 @@ class ExportCoordinator:
         )
 
     def _can_submit_export_request(self, now: float) -> bool:
-        if self._last_export_request_at is None:
-            return True
-        return now >= self._last_export_request_at + EXPORT_GAP_SECONDS
+        return self._get_next_submit_at() <= now
+
+    def _get_next_submit_at(self) -> float:
+        next_submit_at = 0.0
+        if self._last_export_request_at is not None:
+            next_submit_at = self._last_export_request_at + EXPORT_GAP_SECONDS
+        if self._export_cooldown_until is not None:
+            next_submit_at = max(next_submit_at, self._export_cooldown_until)
+        return next_submit_at
 
     def _build_export_gap_payload(
         self,
@@ -349,11 +379,23 @@ class ExportCoordinator:
         now: float | None = None,
     ) -> int | None:
         if not pending_segments or self._last_export_request_at is None:
+            return self._get_cooldown_remaining_seconds(pending_segments, now=now)
+        current_now = self.time_fn() if now is None else now
+        remaining_seconds = int(math.ceil(self._get_next_submit_at() - current_now))
+        if remaining_seconds <= 0:
+            return None
+        return remaining_seconds
+
+    def _get_cooldown_remaining_seconds(
+        self,
+        pending_segments: deque[PendingSegment],
+        *,
+        now: float | None = None,
+    ) -> int | None:
+        if not pending_segments or self._export_cooldown_until is None:
             return None
         current_now = self.time_fn() if now is None else now
-        remaining_seconds = int(
-            math.ceil(self._last_export_request_at + EXPORT_GAP_SECONDS - current_now)
-        )
+        remaining_seconds = int(math.ceil(self._export_cooldown_until - current_now))
         if remaining_seconds <= 0:
             return None
         return remaining_seconds
@@ -366,29 +408,27 @@ class ExportCoordinator:
         now = self.time_fn()
         next_submit_at = math.inf
         if pending_segments:
-            if self._last_export_request_at is None:
-                return
-            next_submit_at = self._last_export_request_at + EXPORT_GAP_SECONDS
+            next_submit_at = self._get_next_submit_at()
 
         next_poll_at = min((task.next_poll_at for task in active_tasks.values()), default=math.inf)
         next_action_at = min(next_submit_at, next_poll_at)
         if math.isinf(next_action_at):
             return
 
-        remaining_seconds = self._get_export_gap_remaining_seconds(pending_segments, now=now)
-        if remaining_seconds is not None:
-            self._emit(
-                "waiting_export_gap",
-                {
-                    "total_seconds": int(EXPORT_GAP_SECONDS),
-                    "remaining_seconds": remaining_seconds,
-                },
-            )
-            self.sleep_fn(min(1.0, max(0.0, next_action_at - now)))
-            return
-
         sleep_seconds = max(0.0, next_action_at - now)
         if sleep_seconds > 0:
+            # Only emit waiting_export_gap when the next action is submitting a new export
+            # (i.e., we are blocked by the export gap, not just waiting for a poll).
+            if pending_segments and next_action_at == next_submit_at:
+                remaining_seconds = self._get_export_gap_remaining_seconds(pending_segments, now=now)
+                if remaining_seconds is not None:
+                    self._emit(
+                        "waiting_export_gap",
+                        {
+                            "total_seconds": int(EXPORT_GAP_SECONDS),
+                            "remaining_seconds": remaining_seconds,
+                        },
+                    )
             self.sleep_fn(sleep_seconds)
 
     def _emit(self, event_name: str, payload: dict[str, Any]) -> None:

@@ -54,8 +54,8 @@ class ExportFilterConfig:
 
     def build_export_body(self, start_ts: int, end_ts: int, request_lid: str) -> dict[str, Any]:
         body = dict(self.body)
-        body["apply_time_start"] = start_ts
-        body["apply_time_end"] = end_ts
+        body["final_time_start"] = start_ts
+        body["final_time_end"] = end_ts
         body["_lid"] = request_lid
         return body
 

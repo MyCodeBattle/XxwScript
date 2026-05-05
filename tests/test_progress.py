@@ -268,6 +268,34 @@ class TimeProgressBarTests(unittest.TestCase):
         )
         self.assertNotIn("结果：文件未生成", output.getvalue())
 
+    def test_plain_progress_bar_logs_retry_cooldown_reason_once(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
+
+        progress.handle_event(
+            "waiting_retry_cooldown",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "remaining_seconds": 181,
+                "message": "店铺3分钟内不允许再次导出，请稍后再试",
+            },
+        )
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                (
+                    f"等待平台冷却重试 {format_local(5)}..{format_local(8)} "
+                    "181s: 店铺3分钟内不允许再次导出，请稍后再试"
+                )
+            ],
+        )
+
     def test_live_progress_bar_ignores_export_gap_countdown_text(self) -> None:
         module = self.load_module()
         if module is None:
@@ -306,6 +334,38 @@ class TimeProgressBarTests(unittest.TestCase):
             )
 
         self.assertNotIn("导出间隔", output.getvalue())
+
+    def test_live_progress_bar_shows_retry_cooldown_status_without_countdown_updates(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = FakeTTYStream()
+        with mock.patch.dict("os.environ", {"TERM": "xterm"}, clear=False):
+            progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
+            progress.handle_event(
+                "waiting_retry_cooldown",
+                {
+                    "start_ts": 5,
+                    "end_ts": 8,
+                    "remaining_seconds": 181,
+                    "message": "店铺3分钟内不允许再次导出，请稍后再试",
+                },
+            )
+            progress.handle_event(
+                "waiting_export_gap",
+                {
+                    "total_seconds": 181,
+                    "remaining_seconds": 180,
+                },
+            )
+
+        rendered = output.getvalue()
+        self.assertIn(
+            f"等待平台冷却重试 {format_local(5)}..{format_local(8)}",
+            rendered,
+        )
+        self.assertNotIn("180s", rendered)
 
     def test_live_progress_bar_keeps_completed_ratio_when_a_later_segment_fails(self) -> None:
         module = self.load_module()

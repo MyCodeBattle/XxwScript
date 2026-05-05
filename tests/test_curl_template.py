@@ -98,15 +98,20 @@ class SeedCurlTests(unittest.TestCase):
         self.assertEqual(tasks_request.params["_lid"], "tasks-lid")
         self.assertEqual(download_request.params["task_id"], "task-a")
         self.assertEqual(download_request.params["_lid"], "download-lid")
-        self.assertEqual(export_request.json["apply_time_start"], 111)
-        self.assertEqual(export_request.json["apply_time_end"], 222)
+        self.assertEqual(export_request.json["final_time_start"], 111)
+        self.assertEqual(export_request.json["final_time_end"], 222)
         self.assertEqual(export_request.json["_lid"], "newlid")
-        self.assertEqual(export_request.json["after_sale_status"], "audit_refunded")
+        self.assertEqual(export_request.json["after_sale_status"], "")
         self.assertEqual(export_request.json["search_receiver"], "")
         self.assertEqual(export_request.json["after_sale_type"], "")
         self.assertEqual(export_request.json["reason"], "")
         self.assertEqual(export_request.json["negotiate_status"], "")
         self.assertEqual(export_request.json["order_logistics_state"], [])
+        self.assertNotIn("appid", export_request.json)
+        self.assertNotIn("__token", export_request.json)
+        self.assertNotIn("_bid", export_request.json)
+        self.assertNotIn("aid", export_request.json)
+        self.assertNotIn("aftersale_platform_source", export_request.json)
 
     def test_default_filter_config_contains_full_hardcoded_body(self) -> None:
         self.assertEqual(
@@ -115,7 +120,7 @@ class SeedCurlTests(unittest.TestCase):
                 "order_by": ["status_deadline asc"],
                 "conf_version": "v13",
                 "search_receiver": "",
-                "after_sale_status": "audit_refunded",
+                "after_sale_status": "",
                 "after_sale_type": "",
                 "reason": "",
                 "negotiate_status": "",
@@ -133,7 +138,7 @@ class SeedCurlTests(unittest.TestCase):
     def test_filter_config_round_trip_preserves_body(self) -> None:
         encoded = json.dumps(ExportFilterConfig.model_dump(DEFAULT_EXPORT_FILTER_CONFIG), sort_keys=True)
 
-        self.assertIn('"after_sale_status": "audit_refunded"', encoded)
+        self.assertIn('"after_sale_status": ""', encoded)
 
 
 if __name__ == "__main__":

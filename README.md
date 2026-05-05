@@ -175,6 +175,7 @@ while pending_segments or active_tasks or ready_downloads:
 **导出请求频率限制：**
 - `EXPORT_GAP_SECONDS = 181` 秒
 - 两次成功创建导出任务（成功返回 `task_id`）之间必须间隔至少 181 秒
+- 如果平台返回“店铺3分钟内不允许再次导出，请稍后再试”，调度器会将其视为可恢复冷却状态，自动等待约 181 秒后重试当前区间
 - `OverLimitError`、鉴权失败、网络失败、响应缺少 `task_id` 等未成功创建任务的请求，不占用这 181 秒间隔
 - 若 pending 队列有任务但未到间隔时间，调度器会 sleep 等待
 
@@ -188,6 +189,7 @@ while pending_segments or active_tasks or ready_downloads:
 - 调度器在关键节点通过 `event_callback` 发送事件：
   - `submitted`：任务已提交
   - `split`：区间因超限被拆分
+  - `waiting_retry_cooldown`：平台命中 3 分钟冷却，等待后重试当前区间
   - `waiting_task`：进入等待文件生成状态
   - `task_polled`：轮询结果
   - `waiting_export_gap`：等待导出间隔；当前仅保留为内部调度事件，不再显示为终端倒计时文案

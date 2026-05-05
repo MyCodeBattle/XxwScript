@@ -6,7 +6,12 @@ import unittest
 
 from aftersale_exporter.api import AftersaleApiService, RequestFailedError, TaskTimeoutError
 from aftersale_exporter.curl_template import DEFAULT_EXPORT_FILTER_CONFIG, parse_seed_curl
-from aftersale_exporter.workflow import AuthenticationError, OverLimitError, TaskPollResult
+from aftersale_exporter.workflow import (
+    AuthenticationError,
+    ExportCooldownError,
+    OverLimitError,
+    TaskPollResult,
+)
 
 
 SEED_CURL = r"""
@@ -115,7 +120,7 @@ class AftersaleApiServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(OverLimitError, "5万条"):
             service.create_export(111, 222)
 
-    def test_create_export_does_not_treat_export_cooldown_as_row_limit(self) -> None:
+    def test_create_export_raises_retryable_cooldown_error(self) -> None:
         service, _ = self.build_service(
             [
                 FakeResponse(
@@ -127,8 +132,10 @@ class AftersaleApiServiceTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaisesRegex(RequestFailedError, "3分钟内不允许再次导出"):
+        with self.assertRaisesRegex(ExportCooldownError, "3分钟内不允许再次导出") as exc_info:
             service.create_export(111, 222)
+
+        self.assertEqual(exc_info.exception.retry_after_seconds, 181)
 
     def test_create_export_raises_authentication_error_on_http_403(self) -> None:
         service, _ = self.build_service([FakeResponse(status_code=403, json_data={})])

@@ -43,6 +43,12 @@ def format_progress_event(
             f"[failed] {format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
             f"{payload['error_type']}: {payload['message']}"
         )
+    if event_name == "waiting_retry_cooldown":
+        return (
+            "等待平台冷却重试 "
+            f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
+            f"{payload['remaining_seconds']}s: {payload['message']}"
+        )
     return None
 
 
@@ -68,6 +74,7 @@ class TimeProgressBar:
         self._live_updates = self._supports_live_updates()
         self._current_task_status: str | None = None
         self._is_waiting_for_generation = False
+        self._is_waiting_for_retry_cooldown = False
         self._current_export_gap_remaining: int | None = None
         self._last_line_length = 0
         if self._live_updates:
@@ -106,6 +113,7 @@ class TimeProgressBar:
     def _build_status(self, event_name: str, payload: dict[str, Any]) -> str:
         if event_name == "split":
             self._is_waiting_for_generation = False
+            self._is_waiting_for_retry_cooldown = False
             self._current_export_gap_remaining = None
             return (
                 "splitting "
@@ -114,20 +122,34 @@ class TimeProgressBar:
         if event_name == "submitted":
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = False
+            self._is_waiting_for_retry_cooldown = False
             self._current_export_gap_remaining = None
             return self._current_task_status
         if event_name == "waiting_task":
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = True
+            self._is_waiting_for_retry_cooldown = False
             self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
             return self._compose_task_status(include_export_gap=False)
         if event_name == "task_polled":
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = True
+            self._is_waiting_for_retry_cooldown = False
             self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
             return self._compose_task_status(include_export_gap=False)
+        if event_name == "waiting_retry_cooldown":
+            self._is_waiting_for_generation = False
+            self._is_waiting_for_retry_cooldown = True
+            self._current_task_status = None
+            self._current_export_gap_remaining = payload.get("remaining_seconds")
+            return (
+                "等待平台冷却重试 "
+                f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
+            )
         if event_name == "waiting_export_gap":
             if not self._live_updates:
+                return self.status
+            if self._is_waiting_for_retry_cooldown:
                 return self.status
             self._current_export_gap_remaining = payload["remaining_seconds"]
             if self._is_waiting_for_generation and self._current_task_status is not None:
@@ -135,6 +157,7 @@ class TimeProgressBar:
             return self.status
         if event_name == "downloaded":
             self._is_waiting_for_generation = False
+            self._is_waiting_for_retry_cooldown = False
             self._current_export_gap_remaining = None
             return (
                 "downloaded "
@@ -142,6 +165,7 @@ class TimeProgressBar:
             )
         if event_name == "failed":
             self._is_waiting_for_generation = False
+            self._is_waiting_for_retry_cooldown = False
             self._current_export_gap_remaining = None
             return (
                 "failed "
@@ -180,7 +204,7 @@ class TimeProgressBar:
             self.stream.write(f"{self._compose_task_status(include_export_gap=False)}\n")
             self._flush()
             return
-        if event_name in {"split", "downloaded", "failed"}:
+        if event_name in {"split", "downloaded", "failed", "waiting_retry_cooldown"}:
             message = format_progress_event(event_name, payload, timezone_name=self.timezone_name)
             if message is None:
                 return
