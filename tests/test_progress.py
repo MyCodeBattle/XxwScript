@@ -296,6 +296,36 @@ class TimeProgressBarTests(unittest.TestCase):
             ],
         )
 
+    def test_plain_progress_bar_logs_timeout_retry_reason_once(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
+
+        progress.handle_event(
+            "retrying_task_timeout",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+                "retry_attempt": 1,
+                "max_retries": 1,
+                "message": "task task-5-8 did not finish before timeout",
+            },
+        )
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                (
+                    f"任务超时自动重试 {format_local(5)}..{format_local(8)} "
+                    "task=task-5-8 1/1: task task-5-8 did not finish before timeout"
+                )
+            ],
+        )
+
     def test_live_progress_bar_ignores_export_gap_countdown_text(self) -> None:
         module = self.load_module()
         if module is None:

@@ -413,6 +413,18 @@ class ExportCoordinatorTests(unittest.TestCase):
                         is_complete=False,
                         download_name=None,
                     ),
+                    TaskPollResult(
+                        requested_at_ts=191,
+                        result_text="文件未生成",
+                        is_complete=False,
+                        download_name=None,
+                    ),
+                    TaskPollResult(
+                        requested_at_ts=206,
+                        result_text="文件未生成",
+                        is_complete=False,
+                        download_name=None,
+                    ),
                 ]
             }
             coordinator = ExportCoordinator(
@@ -424,11 +436,136 @@ class ExportCoordinatorTests(unittest.TestCase):
                 time_fn=clock.monotonic,
             )
 
-            with self.assertRaisesRegex(TimeoutError, "task task-0-1 did not finish before timeout"):
-                coordinator.run(0, 1)
+            result = coordinator.run(0, 1)
 
-        self.assertEqual(service.polled_tasks, ["task-0-1", "task-0-1"])
-        self.assertEqual(clock.now, 25.0)
+        self.assertEqual(result.segment_count, 0)
+        self.assertEqual(result.failed_count, 1)
+        self.assertEqual(service.submissions, [(0, 1), (0, 1)])
+        self.assertEqual(service.polled_tasks, ["task-0-1", "task-0-1", "task-0-1", "task-0-1"])
+        self.assertEqual(clock.now, 216.0)
+
+    def test_task_timeout_retries_once_and_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(
+                poll_sequences={
+                    "task-0-1": [
+                        TaskPollResult(
+                            requested_at_ts=0,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=11,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=181,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-0-1.csv",
+                        ),
+                    ]
+                },
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=11.0,
+                task_timeout=20.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            result = coordinator.run(0, 1)
+
+        self.assertEqual(result.segment_count, 1)
+        self.assertEqual(result.failed_count, 0)
+        self.assertEqual(service.submissions, [(0, 1), (0, 1)])
+        self.assertEqual(service.polled_tasks, ["task-0-1", "task-0-1", "task-0-1"])
+        self.assertEqual(sum(clock.sleeps), 181.0)
+        self.assertEqual(
+            [event_name for event_name, _ in events].count("retrying_task_timeout"),
+            1,
+        )
+        self.assertNotIn("failed", [event_name for event_name, _ in events])
+
+    def test_second_timeout_records_failure_and_scheduler_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(
+                over_limit_ranges={(0, 3)},
+                poll_sequences={
+                    "task-0-1": [
+                        TaskPollResult(
+                            requested_at_ts=0,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=11,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=181,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=192,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                    ],
+                    "task-2-3": [
+                        TaskPollResult(
+                            requested_at_ts=362,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-2-3.csv",
+                        )
+                    ],
+                },
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=11.0,
+                task_timeout=20.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            result = coordinator.run(0, 3)
+
+        self.assertEqual(result.segment_count, 1)
+        self.assertEqual(result.failed_count, 1)
+        self.assertEqual(
+            [(segment.start_ts, segment.end_ts) for segment in result.segments],
+            [(2, 3)],
+        )
+        self.assertEqual(service.submissions, [(0, 3), (0, 1), (0, 1), (2, 3)])
+        self.assertEqual(
+            [event_name for event_name, _ in events].count("retrying_task_timeout"),
+            1,
+        )
+        self.assertEqual([event_name for event_name, _ in events].count("failed"), 1)
+        failed_payload = [payload for event_name, payload in events if event_name == "failed"][0]
+        self.assertEqual(failed_payload["task_id"], "task-0-1")
+        self.assertEqual(failed_payload["error_type"], "TimeoutError")
+        self.assertEqual(sum(clock.sleeps), 362.0)
 
     def test_multiple_waiting_tasks_are_polled_and_first_completed_downloads_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

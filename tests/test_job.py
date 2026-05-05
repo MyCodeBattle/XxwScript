@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook, load_workbook
 
-from aftersale_exporter.job import AftersaleExportJob
+from aftersale_exporter.job import MANIFEST_RUN_SEPARATOR_PREFIX, AftersaleExportJob
 from aftersale_exporter.workflow import OverLimitError, TaskPollResult
 
 
@@ -202,6 +202,15 @@ class DailyCountFakeService(MixedFormatFakeService):
         if key in self.count_failures:
             raise self.count_failures[key]
         return self.count_totals[key]
+
+
+def load_latest_manifest_snapshot(manifest_path: Path) -> dict[str, object]:
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    marker_index = manifest_text.rfind(MANIFEST_RUN_SEPARATOR_PREFIX)
+    if marker_index == -1:
+        return json.loads(manifest_text)
+    latest_start = manifest_text.find("\n", marker_index)
+    return json.loads(manifest_text[latest_start + 1 :].strip())
 
 
 class AftersaleExportJobTests(unittest.TestCase):
@@ -503,6 +512,47 @@ class AftersaleExportJobTests(unittest.TestCase):
         self.assertEqual(manifest["daily_counts"][1]["error_type"], "RuntimeError")
         self.assertEqual(manifest["daily_counts"][1]["message"], "count failed")
         self.assertIn("2026-05-02 | manifest=FAILED | merged=1 | SKIPPED", stdout.getvalue())
+
+    def test_job_keeps_previous_manifest_run_with_separator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first_clock = FakeClock()
+            first_job = AftersaleExportJob(
+                service=DailyCountFakeService(
+                    count_totals={(0, 0): 1},
+                    export_rows={f"task-{0}-{0}": [("A1", "1970-01-01 08:00:00", "v1")]},
+                ),
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=first_clock.sleep,
+                time_fn=first_clock.monotonic,
+            )
+            second_clock = FakeClock()
+            second_job = AftersaleExportJob(
+                service=DailyCountFakeService(
+                    count_totals={(1, 1): 1},
+                    export_rows={f"task-{1}-{1}": [("A2", "1970-01-01 08:00:01", "v2")]},
+                ),
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=second_clock.sleep,
+                time_fn=second_clock.monotonic,
+            )
+
+            first_job.run(start_ts=0, end_ts=0)
+            first_manifest_text = (Path(tmpdir) / "manifest.json").read_text(encoding="utf-8")
+
+            second_job.run(start_ts=1, end_ts=1)
+
+            manifest_path = Path(tmpdir) / "manifest.json"
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+            latest_manifest = load_latest_manifest_snapshot(manifest_path)
+
+        self.assertIn(first_manifest_text.strip(), manifest_text)
+        self.assertIn(MANIFEST_RUN_SEPARATOR_PREFIX, manifest_text)
+        self.assertEqual(latest_manifest["summary"]["segment_count"], 1)
+        self.assertEqual(latest_manifest["segments"][0]["start_ts"], 1)
 
 
 if __name__ == "__main__":

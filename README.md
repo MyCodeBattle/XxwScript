@@ -57,7 +57,7 @@
 - `--seed-curl`：从浏览器开发者工具复制的 curl 文本文件路径（默认 `./seed.curl`）
 - `--out-dir`：输出目录
 - `--poll-interval`：轮询间隔（默认 5 秒）
-- `--task-timeout`：单任务超时时间（默认 1800 秒）
+- `--task-timeout`：单任务超时时间（默认 600 秒）
 - `--timezone`：时区（默认 `Asia/Shanghai`）
 
 **处理细节：**
@@ -150,7 +150,7 @@ while pending_segments or active_tasks or ready_downloads:
     if active_tasks 中有到期的轮询任务:
         按 next_poll_at 排序，依次轮询
         若任务完成 → 移入 ready_downloads
-        若超时 → 抛出 TimeoutError
+        若超时 → 自动重试 1 次；再次超时则记录失败并继续后续区间
         continue
 
     if pending_segments 非空 且 满足导出间隔限制:
@@ -182,8 +182,8 @@ while pending_segments or active_tasks or ready_downloads:
 **轮询与超时：**
 - 每个任务的首次轮询在提交后立即执行
 - 之后按 `--poll-interval`（默认 5 秒）周期性轮询
-- 单任务总等待时间不超过 `--task-timeout`（默认 1800 秒）
-- 超时前最后一次轮询会跳过，直接抛出 `TimeoutError`
+- 单任务总等待时间不超过 `--task-timeout`（默认 600 秒）
+- 单任务首次超时会自动重试 1 次；重试后仍超时则记为失败并继续剩余区间
 
 **事件通知：**
 - 调度器在关键节点通过 `event_callback` 发送事件：
@@ -204,6 +204,7 @@ while pending_segments or active_tasks or ready_downloads:
 
 #### 5.1 Manifest 追踪 (`ManifestTracker`)
 - 在输出目录下实时写入 `manifest.json`
+- 若同一输出目录已存在旧的 `manifest.json`，会保留上一轮内容，并在新旧运行之间插入分隔符
 - 记录每个时间区间的状态：`submitted` → `downloaded` / `failed`
 - 记录所有拆分事件（`splits`）和失败事件（`failures`）
 - 每次事件发生后立即 `write()`，确保崩溃后可恢复现场

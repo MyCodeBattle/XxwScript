@@ -10,10 +10,17 @@ from zoneinfo import ZoneInfo
 from aftersale_exporter.merge import MergeSummary, merge_tabular_exports
 from aftersale_exporter.workflow import ExportCoordinator, ExportRunResult
 
+MANIFEST_RUN_SEPARATOR_PREFIX = "===== manifest run "
+
 
 class ManifestTracker:
     def __init__(self, manifest_path: Path) -> None:
         self.manifest_path = manifest_path
+        self._history_text = self._load_history_text()
+        self._current_run_separator = (
+            f"{MANIFEST_RUN_SEPARATOR_PREFIX}"
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====="
+        )
         self.summary: dict[str, Any] = {
             "segment_count": 0,
             "failed_count": 0,
@@ -116,10 +123,22 @@ class ManifestTracker:
             "failures": self.failures,
             "daily_counts": self.daily_counts,
         }
-        self.manifest_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        manifest_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if self._history_text:
+            manifest_text = (
+                f"{self._history_text}\n\n"
+                f"{self._current_run_separator}\n"
+                f"{manifest_text}"
+            )
+        self.manifest_path.write_text(manifest_text, encoding="utf-8")
+
+    def _load_history_text(self) -> str:
+        if not self.manifest_path.exists():
+            return ""
+        existing_text = self.manifest_path.read_text(encoding="utf-8").strip()
+        if not existing_text:
+            return ""
+        return existing_text
 
     def _find_or_create_segment(self, start_ts: int, end_ts: int) -> dict[str, Any]:
         for segment in self.segments:

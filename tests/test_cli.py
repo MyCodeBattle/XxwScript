@@ -10,7 +10,7 @@ import aftersale_exporter.cli as cli_module
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from aftersale_exporter.cli import main, parse_local_timestamp
+from aftersale_exporter.cli import build_parser, main, parse_local_timestamp
 from aftersale_exporter.curl_template import DEFAULT_EXPORT_FILTER_CONFIG
 
 
@@ -28,6 +28,11 @@ curl 'https://fxg.jinritemai.com/ffa/maftersale/aftersale/list?appid=1&__token=a
 
 
 class CliTests(unittest.TestCase):
+    def test_task_timeout_defaults_to_ten_minutes(self) -> None:
+        parser = build_parser()
+
+        self.assertEqual(parser.get_default("task_timeout"), 600.0)
+
     def test_cli_script_runs_directly_without_import_error(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         script_path = repo_root / "aftersale_exporter" / "cli.py"

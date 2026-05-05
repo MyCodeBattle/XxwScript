@@ -49,6 +49,13 @@ def format_progress_event(
             f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
             f"{payload['remaining_seconds']}s: {payload['message']}"
         )
+    if event_name == "retrying_task_timeout":
+        return (
+            "任务超时自动重试 "
+            f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
+            f"task={payload['task_id']} "
+            f"{payload['retry_attempt']}/{payload['max_retries']}: {payload['message']}"
+        )
     if event_name == "counted":
         return (
             f"[counted] {payload['date']} "
@@ -158,6 +165,15 @@ class TimeProgressBar:
                 "等待平台冷却重试 "
                 f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
             )
+        if event_name == "retrying_task_timeout":
+            self._is_waiting_for_generation = False
+            self._is_waiting_for_retry_cooldown = False
+            self._current_task_status = None
+            self._current_export_gap_remaining = None
+            return (
+                "任务超时自动重试 "
+                f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
+            )
         if event_name == "waiting_export_gap":
             if not self._live_updates:
                 return self.status
@@ -225,6 +241,7 @@ class TimeProgressBar:
             "downloaded",
             "failed",
             "waiting_retry_cooldown",
+            "retrying_task_timeout",
             "counted",
             "count_failed",
         }:

@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="Seconds between task polling requests")
-    parser.add_argument("--task-timeout", type=float, default=1800.0, help="Maximum seconds to wait for a single export task")
+    parser.add_argument("--task-timeout", type=float, default=900.0, help="Maximum seconds to wait for a single export task")
     parser.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for --start/--end parsing")
     return parser
 

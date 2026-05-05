@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable, Protocol
 
 EXPORT_GAP_SECONDS = 181.0
+TASK_TIMEOUT_RETRY_LIMIT = 1
 
 
 class ExportError(Exception):
@@ -65,6 +66,7 @@ class ExportRunResult:
 class PendingSegment:
     start_ts: int
     end_ts: int
+    timeout_retries: int = 0
 
 
 @dataclass
@@ -74,6 +76,7 @@ class ActiveExportTask:
     task_id: str
     deadline_at: float
     next_poll_at: float
+    timeout_retries: int = 0
 
 
 @dataclass
@@ -82,6 +85,13 @@ class ReadyDownload:
     end_ts: int
     task_id: str
     download_name: str
+
+
+@dataclass(frozen=True)
+class TaskPollOutcome:
+    ready_download: ReadyDownload | None = None
+    retry_segment: PendingSegment | None = None
+    task_failed: bool = False
 
 
 class ExportService(Protocol):
@@ -127,15 +137,16 @@ class ExportCoordinator:
     def run(self, start_ts: int, end_ts: int) -> ExportRunResult:
         self._last_export_request_at = None
         self._export_cooldown_until = None
-        segments = self._run_scheduler(start_ts, end_ts)
+        segments, failed_count = self._run_scheduler(start_ts, end_ts)
         ordered_segments = sorted(segments, key=lambda item: (item.start_ts, item.end_ts))
-        return ExportRunResult(segments=ordered_segments, failed_count=0)
+        return ExportRunResult(segments=ordered_segments, failed_count=failed_count)
 
-    def _run_scheduler(self, start_ts: int, end_ts: int) -> list[ExportSegment]:
+    def _run_scheduler(self, start_ts: int, end_ts: int) -> tuple[list[ExportSegment], int]:
         pending_segments: deque[PendingSegment] = deque([PendingSegment(start_ts, end_ts)])
         active_tasks: dict[str, ActiveExportTask] = {}
         ready_downloads: deque[ReadyDownload] = deque()
         completed_segments: list[ExportSegment] = []
+        failed_count = 0
 
         while pending_segments or active_tasks or ready_downloads:
             if ready_downloads:
@@ -152,11 +163,18 @@ class ExportCoordinator:
             if due_tasks:
                 due_tasks.sort(key=lambda item: (item.next_poll_at, item.start_ts, item.end_ts))
                 for task in due_tasks:
-                    ready = self._poll_active_task(task, pending_segments)
-                    if ready is None:
+                    outcome = self._poll_active_task(task, pending_segments)
+                    if outcome.ready_download is not None:
+                        active_tasks.pop(task.task_id, None)
+                        ready_downloads.append(outcome.ready_download)
                         continue
-                    active_tasks.pop(task.task_id, None)
-                    ready_downloads.append(ready)
+                    if outcome.retry_segment is not None:
+                        active_tasks.pop(task.task_id, None)
+                        pending_segments.appendleft(outcome.retry_segment)
+                        continue
+                    if outcome.task_failed:
+                        active_tasks.pop(task.task_id, None)
+                        failed_count += 1
                 continue
 
             if pending_segments and self._can_submit_export_request(now):
@@ -168,7 +186,7 @@ class ExportCoordinator:
 
             self._sleep_until_next_action(pending_segments, active_tasks)
 
-        return completed_segments
+        return completed_segments, failed_count
 
     def _submit_pending_segment(
         self,
@@ -256,13 +274,14 @@ class ExportCoordinator:
             task_id=task_id,
             deadline_at=submitted_at + self.task_timeout,
             next_poll_at=submitted_at,
+            timeout_retries=segment.timeout_retries,
         )
 
     def _poll_active_task(
         self,
         task: ActiveExportTask,
         pending_segments: deque[PendingSegment],
-    ) -> ReadyDownload | None:
+    ) -> TaskPollOutcome:
         try:
             poll_result = self.service.poll_task(task.task_id)
         except Exception as exc:
@@ -290,16 +309,38 @@ class ExportCoordinator:
         self._emit("task_polled", poll_payload)
         if poll_result.is_complete:
             download_name = poll_result.download_name or f"{task.task_id}.bin"
-            return ReadyDownload(
-                start_ts=task.start_ts,
-                end_ts=task.end_ts,
-                task_id=task.task_id,
-                download_name=download_name,
+            return TaskPollOutcome(
+                ready_download=ReadyDownload(
+                    start_ts=task.start_ts,
+                    end_ts=task.end_ts,
+                    task_id=task.task_id,
+                    download_name=download_name,
+                )
             )
 
         now = self.time_fn()
         if now + self.poll_interval > task.deadline_at:
             timeout_error = TimeoutError(f"task {task.task_id} did not finish before timeout")
+            if task.timeout_retries < TASK_TIMEOUT_RETRY_LIMIT:
+                retry_attempt = task.timeout_retries + 1
+                self._emit(
+                    "retrying_task_timeout",
+                    {
+                        "start_ts": task.start_ts,
+                        "end_ts": task.end_ts,
+                        "task_id": task.task_id,
+                        "retry_attempt": retry_attempt,
+                        "max_retries": TASK_TIMEOUT_RETRY_LIMIT,
+                        "message": str(timeout_error),
+                    },
+                )
+                return TaskPollOutcome(
+                    retry_segment=PendingSegment(
+                        task.start_ts,
+                        task.end_ts,
+                        timeout_retries=retry_attempt,
+                    )
+                )
             self._emit(
                 "failed",
                 {
@@ -310,9 +351,9 @@ class ExportCoordinator:
                     "message": str(timeout_error),
                 },
             )
-            raise timeout_error
+            return TaskPollOutcome(task_failed=True)
         task.next_poll_at = now + self.poll_interval
-        return None
+        return TaskPollOutcome()
 
     def _download_ready_task(self, ready: ReadyDownload) -> ExportSegment:
         try:
