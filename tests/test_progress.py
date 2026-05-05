@@ -443,6 +443,67 @@ class TimeProgressBarTests(unittest.TestCase):
         )
         self.assertTrue(rendered.endswith("\n"))
 
+    def test_plain_progress_bar_logs_daily_count_events(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=8, end_ts=8, stream=output)
+
+        progress.handle_event(
+            "counted",
+            {
+                "date": "2026-05-05",
+                "start_ts": 8,
+                "end_ts": 8,
+                "total": 15,
+            },
+        )
+        progress.handle_event(
+            "count_failed",
+            {
+                "date": "2026-05-06",
+                "start_ts": 8,
+                "end_ts": 9,
+                "error_type": "RuntimeError",
+                "message": "count failed",
+            },
+        )
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                f"[counted] 2026-05-05 {format_local(8)}..{format_local(8)} total=15",
+                f"[count_failed] 2026-05-06 {format_local(8)}..{format_local(9)} RuntimeError: count failed",
+            ],
+        )
+
+    def test_live_progress_bar_logs_daily_count_events(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = FakeTTYStream()
+        with mock.patch.dict("os.environ", {"TERM": "xterm"}, clear=False):
+            progress = module.TimeProgressBar(start_ts=8, end_ts=8, stream=output)
+            progress.handle_event(
+                "counted",
+                {
+                    "date": "2026-05-05",
+                    "start_ts": 8,
+                    "end_ts": 8,
+                    "total": 15,
+                },
+            )
+
+        rendered = output.getvalue()
+        self.assertIn(
+            f"[counted] 2026-05-05 {format_local(8)}..{format_local(8)} total=15",
+            rendered,
+        )
+        self.assertIn("\r", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

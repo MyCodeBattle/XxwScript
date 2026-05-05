@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, time as datetime_time, timedelta
 import json
 from pathlib import Path
 import time
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from aftersale_exporter.merge import merge_tabular_exports
 from aftersale_exporter.workflow import ExportCoordinator, ExportRunResult
@@ -15,10 +17,13 @@ class ManifestTracker:
         self.summary: dict[str, Any] = {
             "segment_count": 0,
             "failed_count": 0,
+            "daily_count_days": 0,
+            "daily_count_failed_days": 0,
         }
         self.segments: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
         self.splits: list[dict[str, Any]] = []
+        self.daily_counts: list[dict[str, Any]] = []
         self.write()
 
     def handle(self, event_name: str, payload: dict[str, Any]) -> None:
@@ -51,7 +56,39 @@ class ManifestTracker:
             )
             self.failures.append(dict(payload))
             self.summary["failed_count"] = len(self.failures)
+        elif event_name == "counted":
+            daily_count = self._find_or_create_daily_count(
+                payload["date"],
+                payload["start_ts"],
+                payload["end_ts"],
+            )
+            daily_count.update(
+                {
+                    "status": "counted",
+                    "total": payload["total"],
+                }
+            )
+            daily_count.pop("error_type", None)
+            daily_count.pop("message", None)
+        elif event_name == "count_failed":
+            daily_count = self._find_or_create_daily_count(
+                payload["date"],
+                payload["start_ts"],
+                payload["end_ts"],
+            )
+            daily_count.update(
+                {
+                    "status": "failed",
+                    "error_type": payload["error_type"],
+                    "message": payload["message"],
+                }
+            )
+            daily_count.pop("total", None)
         self.summary["segment_count"] = len(self.segments)
+        self.summary["daily_count_days"] = len(self.daily_counts)
+        self.summary["daily_count_failed_days"] = sum(
+            1 for item in self.daily_counts if item.get("status") == "failed"
+        )
         self.write()
 
     def finalize(self, result: ExportRunResult | None, merge_error: str | None = None) -> None:
@@ -77,6 +114,7 @@ class ManifestTracker:
             "segments": self.segments,
             "splits": self.splits,
             "failures": self.failures,
+            "daily_counts": self.daily_counts,
         }
         self.manifest_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -94,6 +132,23 @@ class ManifestTracker:
         self.segments.append(segment)
         return segment
 
+    def _find_or_create_daily_count(
+        self,
+        date: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> dict[str, Any]:
+        for daily_count in self.daily_counts:
+            if daily_count["date"] == date:
+                return daily_count
+        daily_count = {
+            "date": date,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+        }
+        self.daily_counts.append(daily_count)
+        return daily_count
+
 
 class AftersaleExportJob:
     def __init__(
@@ -104,6 +159,7 @@ class AftersaleExportJob:
         poll_interval: float,
         task_timeout: float,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        timezone_name: str = "Asia/Shanghai",
         sleep_fn: Callable[[float], None] | None = None,
         time_fn: Callable[[], float] | None = None,
     ) -> None:
@@ -112,6 +168,7 @@ class AftersaleExportJob:
         self.poll_interval = poll_interval
         self.task_timeout = task_timeout
         self.progress_callback = progress_callback
+        self.timezone_name = timezone_name
         self.sleep_fn = time.sleep if sleep_fn is None else sleep_fn
         self.time_fn = time.monotonic if time_fn is None else time_fn
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -134,27 +191,27 @@ class AftersaleExportJob:
         try:
             try:
                 result = coordinator.run(start_ts, end_ts)
+            except Exception:
+                tracker.finalize(result, merge_error=merge_error)
+                raise
+
+            try:
                 merge_tabular_exports(
                     [segment.file_path for segment in result.segments],
                     self.out_dir / "merged.xlsx",
                 )
             except ValueError as exc:
-                if result is not None:
-                    merge_error = str(exc)
-                else:
-                    tracker.handle(
-                        "failed",
-                        {
-                            "start_ts": start_ts,
-                            "end_ts": end_ts,
-                            "error_type": exc.__class__.__name__,
-                            "message": str(exc),
-                        },
-                    )
-                    raise
+                merge_error = str(exc)
             except Exception:
                 tracker.finalize(result, merge_error=merge_error)
                 raise
+
+            try:
+                self._record_daily_counts(start_ts, end_ts)
+            except Exception:
+                tracker.finalize(result, merge_error=merge_error)
+                raise
+
             tracker.finalize(result, merge_error=merge_error)
         finally:
             self._active_tracker = None
@@ -166,3 +223,60 @@ class AftersaleExportJob:
             tracker.handle(event_name, payload)
         if self.progress_callback is not None:
             self.progress_callback(event_name, payload)
+
+    def _record_daily_counts(self, start_ts: int, end_ts: int) -> None:
+        for date, day_start_ts, day_end_ts in _iter_daily_ranges(
+            start_ts,
+            end_ts,
+            timezone_name=self.timezone_name,
+        ):
+            try:
+                total = self.service.count_aftersales(day_start_ts, day_end_ts)
+            except Exception as exc:
+                self._emit_event(
+                    "count_failed",
+                    {
+                        "date": date,
+                        "start_ts": day_start_ts,
+                        "end_ts": day_end_ts,
+                        "error_type": exc.__class__.__name__,
+                        "message": str(exc),
+                    },
+                )
+                continue
+            self._emit_event(
+                "counted",
+                {
+                    "date": date,
+                    "start_ts": day_start_ts,
+                    "end_ts": day_end_ts,
+                    "total": total,
+                },
+            )
+
+
+def _iter_daily_ranges(
+    start_ts: int,
+    end_ts: int,
+    *,
+    timezone_name: str,
+) -> list[tuple[str, int, int]]:
+    timezone = ZoneInfo(timezone_name)
+    start_date = datetime.fromtimestamp(start_ts, tz=timezone).date()
+    end_date = datetime.fromtimestamp(end_ts, tz=timezone).date()
+    current_date = start_date
+    ranges: list[tuple[str, int, int]] = []
+
+    while current_date <= end_date:
+        day_start = datetime.combine(current_date, datetime_time.min, tzinfo=timezone)
+        next_day_start = datetime.combine(
+            current_date + timedelta(days=1),
+            datetime_time.min,
+            tzinfo=timezone,
+        )
+        day_start_ts = max(start_ts, int(day_start.timestamp()))
+        day_end_ts = min(end_ts, int(next_day_start.timestamp()) - 1)
+        ranges.append((current_date.isoformat(), day_start_ts, day_end_ts))
+        current_date += timedelta(days=1)
+
+    return ranges

@@ -100,8 +100,8 @@ class AftersaleApiServiceTests(unittest.TestCase):
         )
         self.assertEqual(session.calls[0]["params"]["appid"], "1")
         self.assertEqual(session.calls[0]["params"]["_lid"], "generated-lid")
-        self.assertEqual(session.calls[0]["json"]["apply_time_start"], 111)
-        self.assertEqual(session.calls[0]["json"]["apply_time_end"], 222)
+        self.assertEqual(session.calls[0]["json"]["final_time_start"], 111)
+        self.assertEqual(session.calls[0]["json"]["final_time_end"], 222)
         self.assertEqual(session.calls[0]["json"]["after_sale_status"], "audit_refunded")
         self.assertEqual(session.calls[0]["json"]["search_receiver"], "")
 
@@ -506,6 +506,41 @@ class AftersaleApiServiceTests(unittest.TestCase):
 
             self.assertEqual(final_path.name, "task-1.xlsx")
             self.assertEqual(final_path.read_bytes(), b"xlsx-bytes")
+
+    def test_count_aftersales_returns_top_level_total_from_list_endpoint(self) -> None:
+        service, session = self.build_service(
+            [FakeResponse(json_data={"code": 0, "total": 321, "data": {"items": []}})]
+        )
+
+        total = service.count_aftersales(111, 222)
+
+        self.assertEqual(total, 321)
+        self.assertEqual(
+            session.calls[0]["url"],
+            "https://fxg.jinritemai.com/after_sale/pc/list",
+        )
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["params"]["_lid"], "generated-lid")
+        self.assertEqual(session.calls[0]["json"]["page"], 1)
+        self.assertEqual(session.calls[0]["json"]["pageSize"], 10)
+        self.assertEqual(session.calls[0]["json"]["final_time_start"], 111)
+        self.assertEqual(session.calls[0]["json"]["final_time_end"], 222)
+
+    def test_count_aftersales_rejects_missing_total(self) -> None:
+        service, _ = self.build_service(
+            [FakeResponse(json_data={"code": 0, "data": {"items": []}})]
+        )
+
+        with self.assertRaisesRegex(RequestFailedError, "total"):
+            service.count_aftersales(111, 222)
+
+    def test_count_aftersales_rejects_non_integer_total(self) -> None:
+        service, _ = self.build_service(
+            [FakeResponse(json_data={"code": 0, "total": "oops", "data": {"items": []}})]
+        )
+
+        with self.assertRaisesRegex(RequestFailedError, "total"):
+            service.count_aftersales(111, 222)
 
 
 if __name__ == "__main__":

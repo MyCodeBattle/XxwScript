@@ -49,6 +49,18 @@ def format_progress_event(
             f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
             f"{payload['remaining_seconds']}s: {payload['message']}"
         )
+    if event_name == "counted":
+        return (
+            f"[counted] {payload['date']} "
+            f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
+            f"total={payload['total']}"
+        )
+    if event_name == "count_failed":
+        return (
+            f"[count_failed] {payload['date']} "
+            f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
+            f"{payload['error_type']}: {payload['message']}"
+        )
     return None
 
 
@@ -171,6 +183,10 @@ class TimeProgressBar:
                 "failed "
                 f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
             )
+        if event_name == "counted":
+            return f"counted {payload['date']} total={payload['total']}"
+        if event_name == "count_failed":
+            return f"count failed {payload['date']}"
         return event_name
 
     def _format_submitted_status(self, payload: dict[str, Any]) -> str:
@@ -204,7 +220,14 @@ class TimeProgressBar:
             self.stream.write(f"{self._compose_task_status(include_export_gap=False)}\n")
             self._flush()
             return
-        if event_name in {"split", "downloaded", "failed", "waiting_retry_cooldown"}:
+        if event_name in {
+            "split",
+            "downloaded",
+            "failed",
+            "waiting_retry_cooldown",
+            "counted",
+            "count_failed",
+        }:
             message = format_progress_event(event_name, payload, timezone_name=self.timezone_name)
             if message is None:
                 return

@@ -80,6 +80,14 @@ class SeedCurlTests(unittest.TestCase):
             task_id="task-a",
             request_lid="download-lid",
         )
+        list_request = seed.build_aftersale_list_request(
+            filter_config=DEFAULT_EXPORT_FILTER_CONFIG,
+            start_ts=333,
+            end_ts=444,
+            page=1,
+            page_size=10,
+            request_lid="count-lid",
+        )
 
         self.assertEqual(
             export_request.url,
@@ -93,20 +101,32 @@ class SeedCurlTests(unittest.TestCase):
             download_request.url,
             "https://fxg.jinritemai.com/shopuser/aftersale/export/download",
         )
+        self.assertEqual(
+            list_request.url,
+            "https://fxg.jinritemai.com/after_sale/pc/list",
+        )
         self.assertEqual(export_request.params["_lid"], "newlid")
         self.assertEqual(tasks_request.params["task_id_list"], "task-a,task-b")
         self.assertEqual(tasks_request.params["_lid"], "tasks-lid")
         self.assertEqual(download_request.params["task_id"], "task-a")
         self.assertEqual(download_request.params["_lid"], "download-lid")
+        self.assertEqual(list_request.params["_lid"], "count-lid")
         self.assertEqual(export_request.json["final_time_start"], 111)
         self.assertEqual(export_request.json["final_time_end"], 222)
         self.assertEqual(export_request.json["_lid"], "newlid")
-        self.assertEqual(export_request.json["after_sale_status"], "")
+        self.assertEqual(export_request.json["after_sale_status"], "audit_refunded")
         self.assertEqual(export_request.json["search_receiver"], "")
         self.assertEqual(export_request.json["after_sale_type"], "")
         self.assertEqual(export_request.json["reason"], "")
         self.assertEqual(export_request.json["negotiate_status"], "")
         self.assertEqual(export_request.json["order_logistics_state"], [])
+        self.assertEqual(list_request.method, "POST")
+        self.assertEqual(list_request.json["page"], 1)
+        self.assertEqual(list_request.json["pageSize"], 10)
+        self.assertEqual(list_request.json["final_time_start"], 333)
+        self.assertEqual(list_request.json["final_time_end"], 444)
+        self.assertEqual(list_request.json["_lid"], "count-lid")
+        self.assertEqual(list_request.json["after_sale_status"], "audit_refunded")
         self.assertNotIn("appid", export_request.json)
         self.assertNotIn("__token", export_request.json)
         self.assertNotIn("_bid", export_request.json)
@@ -120,7 +140,7 @@ class SeedCurlTests(unittest.TestCase):
                 "order_by": ["status_deadline asc"],
                 "conf_version": "v13",
                 "search_receiver": "",
-                "after_sale_status": "",
+                "after_sale_status": "audit_refunded",
                 "after_sale_type": "",
                 "reason": "",
                 "negotiate_status": "",
@@ -138,7 +158,7 @@ class SeedCurlTests(unittest.TestCase):
     def test_filter_config_round_trip_preserves_body(self) -> None:
         encoded = json.dumps(ExportFilterConfig.model_dump(DEFAULT_EXPORT_FILTER_CONFIG), sort_keys=True)
 
-        self.assertIn('"after_sale_status": ""', encoded)
+        self.assertIn('"after_sale_status": "audit_refunded"', encoded)
 
 
 if __name__ == "__main__":

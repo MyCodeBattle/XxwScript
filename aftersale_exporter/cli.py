@@ -89,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         poll_interval=args.poll_interval,
         task_timeout=args.task_timeout,
         progress_callback=progress.handle_event,
+        timezone_name=args.timezone,
     )
     try:
         job.run(

@@ -10,6 +10,7 @@ FXG_ORIGIN = "https://fxg.jinritemai.com"
 EXPORT_PATH = "/shopuser/aftersale/export"
 TASKS_PATH = "/shopuser/aftersale/export/tasks"
 DOWNLOAD_PATH = "/shopuser/aftersale/export/download"
+AFTERSALE_LIST_PATH = "/after_sale/pc/list"
 QUERY_WHITELIST = (
     "appid",
     "__token",
@@ -20,6 +21,13 @@ QUERY_WHITELIST = (
     "a_bogus",
     "verifyFp",
     "fp",
+)
+LIST_BODY_QUERY_FIELDS = (
+    "appid",
+    "__token",
+    "_bid",
+    "aid",
+    "aftersale_platform_source",
 )
 DEFAULT_EXPORT_FILTER_BODY: dict[str, Any] = {
     "order_by": ["status_deadline asc"],
@@ -57,6 +65,26 @@ class ExportFilterConfig:
         body["final_time_start"] = start_ts
         body["final_time_end"] = end_ts
         body["_lid"] = request_lid
+        return body
+
+    def build_aftersale_list_body(
+        self,
+        *,
+        start_ts: int,
+        end_ts: int,
+        page: int,
+        page_size: int,
+        request_lid: str,
+        query: dict[str, str],
+    ) -> dict[str, Any]:
+        body = self.build_export_body(start_ts, end_ts, request_lid)
+        body["page"] = page
+        body["pageSize"] = page_size
+        for name in LIST_BODY_QUERY_FIELDS:
+            if name not in query:
+                continue
+            value = query[name]
+            body[name] = int(value) if name in {"appid", "aid"} else value
         return body
 
 
@@ -113,6 +141,32 @@ class SessionSeed:
             headers=dict(self.headers),
             cookies=dict(self.cookies),
             json=None,
+        )
+
+    def build_aftersale_list_request(
+        self,
+        *,
+        filter_config: ExportFilterConfig,
+        start_ts: int,
+        end_ts: int,
+        page: int,
+        page_size: int,
+        request_lid: str,
+    ) -> HttpRequest:
+        return HttpRequest(
+            method="POST",
+            url=f"{self.origin}{AFTERSALE_LIST_PATH}",
+            params=self._build_params(request_lid),
+            headers=dict(self.headers),
+            cookies=dict(self.cookies),
+            json=filter_config.build_aftersale_list_body(
+                start_ts=start_ts,
+                end_ts=end_ts,
+                page=page,
+                page_size=page_size,
+                request_lid=request_lid,
+                query=self.query,
+            ),
         )
 
     def _build_params(self, request_lid: str) -> dict[str, str]:

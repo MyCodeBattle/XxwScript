@@ -6,7 +6,10 @@ import time
 from typing import Any, Callable
 from urllib.parse import unquote_to_bytes
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - exercised indirectly in tests
+    requests = None
 
 from aftersale_exporter.curl_template import (
     DEFAULT_EXPORT_FILTER_CONFIG,
@@ -45,6 +48,8 @@ class AftersaleApiService:
 
     def __post_init__(self) -> None:
         if self.session is None:
+            if requests is None:
+                raise ModuleNotFoundError("requests is required to create the default HTTP session")
             self.session = requests.Session()
         if self.lid_factory is None:
             self.lid_factory = lambda: str(int(time.time() * 1000))
@@ -107,6 +112,18 @@ class AftersaleApiService:
         final_path.write_bytes(response.content)
         return final_path
 
+    def count_aftersales(self, start_ts: int, end_ts: int) -> int:
+        request = self.session_seed.build_aftersale_list_request(
+            filter_config=self.filter_config,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            page=1,
+            page_size=10,
+            request_lid=self.lid_factory(),
+        )
+        payload = self._send_json(request)
+        return _extract_total(payload)
+
     def _send_json(self, request: HttpRequest) -> dict[str, Any]:
         response = self._send(request)
         payload = response.json()
@@ -127,7 +144,7 @@ class AftersaleApiService:
                     cookies=request.cookies,
                     json=request.json,
                 )
-            except requests.RequestException as exc:
+            except _request_exception_types() as exc:
                 last_error = exc
                 if attempt == self.max_retries:
                     raise RequestFailedError(f"request failed after retries: {exc}") from exc
@@ -150,6 +167,12 @@ def _raise_for_business_error(payload: dict[str, Any]) -> None:
     if int(code) == 20309001 and "3分钟内不允许再次导出" in message:
         raise ExportCooldownError(message, retry_after_seconds=int(EXPORT_GAP_SECONDS))
     raise RequestFailedError(message)
+
+
+def _request_exception_types() -> tuple[type[Exception], ...]:
+    if requests is None:
+        return (Exception,)
+    return (requests.RequestException,)
 
 
 def _extract_task_id(payload: dict[str, Any]) -> str:
@@ -183,6 +206,15 @@ def _extract_task(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
     if isinstance(data, dict):
         return data
     raise RequestFailedError("unable to locate task details in response")
+
+
+def _extract_total(payload: dict[str, Any]) -> int:
+    total = payload.get("total")
+    if total is None:
+        raise RequestFailedError("response does not include total")
+    if not isinstance(total, int):
+        raise RequestFailedError("response total is not an integer")
+    return total
 
 
 def _is_task_complete(task: dict[str, Any]) -> bool:
