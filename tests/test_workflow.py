@@ -141,7 +141,7 @@ class ExportCoordinatorTests(unittest.TestCase):
             [(segment.start_ts, segment.end_ts) for segment in result.segments],
             [(0, 4), (5, 9)],
         )
-        self.assertEqual(sum(clock.sleeps), 362.0)
+        self.assertEqual(sum(clock.sleeps), 181.0)
 
     def test_waiting_generation_time_counts_toward_next_export_request_gap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -190,10 +190,161 @@ class ExportCoordinatorTests(unittest.TestCase):
         self.assertEqual(service.submissions, [(0, 3), (0, 1), (2, 3)])
         self.assertEqual(
             [event_name for event_name, _ in events].count("waiting_export_gap"),
-            362,
+            181,
         )
-        self.assertEqual(clock.sleeps.count(1.0), 362)
+        self.assertEqual(clock.sleeps.count(1.0), 181)
         self.assertEqual(service.polled_tasks, ["task-0-1", "task-2-3", "task-0-1"])
+
+    def test_waiting_generation_keeps_emitting_export_gap_before_next_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = FakeService(
+                over_limit_ranges={(0, 3)},
+                poll_sequences={
+                    "task-0-1": [
+                        TaskPollResult(
+                            requested_at_ts=0,
+                            result_text="文件未生成",
+                            is_complete=False,
+                            download_name=None,
+                        ),
+                        TaskPollResult(
+                            requested_at_ts=100,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-0-1.csv",
+                        ),
+                    ],
+                    "task-2-3": [
+                        TaskPollResult(
+                            requested_at_ts=181,
+                            result_text="文件已生成",
+                            is_complete=True,
+                            download_name="task-2-3.csv",
+                        )
+                    ],
+                },
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=100.0,
+                task_timeout=1000.0,
+                event_callback=lambda event_name, payload: events.append((event_name, payload)),
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            result = coordinator.run(0, 3)
+
+        self.assertEqual(result.segment_count, 2)
+        self.assertEqual(service.polled_tasks, ["task-0-1", "task-0-1", "task-2-3"])
+        self.assertEqual(
+            [event_name for event_name, _ in events].count("waiting_export_gap"),
+            181,
+        )
+        waiting_task_payload = [payload for event_name, payload in events if event_name == "waiting_task"][0]
+        self.assertEqual(waiting_task_payload["export_gap_total_seconds"], 181)
+        self.assertEqual(waiting_task_payload["export_gap_remaining_seconds"], 181)
+        task_polled_payloads = [payload for event_name, payload in events if event_name == "task_polled"]
+        self.assertEqual(task_polled_payloads[0]["export_gap_total_seconds"], 181)
+        self.assertEqual(task_polled_payloads[0]["export_gap_remaining_seconds"], 181)
+
+    def test_export_gap_starts_when_task_creation_succeeds(self) -> None:
+        class SlowCreateService(FakeService):
+            def __init__(self, *, clock: FakeClock) -> None:
+                super().__init__()
+                self.clock = clock
+                self.submission_started_at: list[float] = []
+
+            def create_export(self, start_ts: int, end_ts: int) -> str:
+                self.submission_started_at.append(self.clock.monotonic())
+                if (start_ts, end_ts) == (0, 1):
+                    self.clock.now += 10.0
+                return super().create_export(start_ts, end_ts)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = SlowCreateService(clock=clock)
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=20.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            service.poll_sequences = {
+                "task-0-1": [
+                    TaskPollResult(
+                        requested_at_ts=10,
+                        result_text="文件已生成",
+                        is_complete=True,
+                        download_name="task-0-1.csv",
+                    )
+                ],
+                "task-2-3": [
+                    TaskPollResult(
+                        requested_at_ts=191,
+                        result_text="文件已生成",
+                        is_complete=True,
+                        download_name="task-2-3.csv",
+                    )
+                ],
+            }
+            service.over_limit_ranges = {(0, 3)}
+
+            result = coordinator.run(0, 3)
+
+        self.assertEqual(result.segment_count, 2)
+        self.assertEqual(service.submission_started_at, [0.0, 0.0, 191.0])
+        self.assertEqual(service.submissions, [(0, 3), (0, 1), (2, 3)])
+
+    def test_task_timeout_starts_when_task_creation_succeeds(self) -> None:
+        class SlowCreateService(FakeService):
+            def __init__(self, *, clock: FakeClock) -> None:
+                super().__init__()
+                self.clock = clock
+
+            def create_export(self, start_ts: int, end_ts: int) -> str:
+                self.clock.now += 10.0
+                return super().create_export(start_ts, end_ts)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            service = SlowCreateService(clock=clock)
+            service.poll_sequences = {
+                "task-0-1": [
+                    TaskPollResult(
+                        requested_at_ts=10,
+                        result_text="文件未生成",
+                        is_complete=False,
+                        download_name=None,
+                    ),
+                    TaskPollResult(
+                        requested_at_ts=25,
+                        result_text="文件未生成",
+                        is_complete=False,
+                        download_name=None,
+                    ),
+                ]
+            }
+            coordinator = ExportCoordinator(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=15.0,
+                task_timeout=20.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+            )
+
+            with self.assertRaisesRegex(TimeoutError, "task task-0-1 did not finish before timeout"):
+                coordinator.run(0, 1)
+
+        self.assertEqual(service.polled_tasks, ["task-0-1", "task-0-1"])
+        self.assertEqual(clock.now, 25.0)
 
     def test_multiple_waiting_tasks_are_polled_and_first_completed_downloads_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

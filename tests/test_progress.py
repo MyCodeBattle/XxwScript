@@ -88,7 +88,7 @@ class TimeProgressBarTests(unittest.TestCase):
         self.assertIn("100.0%", rendered)
         self.assertNotIn("6/6", rendered)
 
-    def test_progress_bar_shows_latest_polled_request_time_and_result(self) -> None:
+    def test_progress_bar_keeps_submitted_status_on_same_line_while_waiting_for_generation(self) -> None:
         module = self.load_module()
         if module is None:
             return
@@ -97,6 +97,64 @@ class TimeProgressBarTests(unittest.TestCase):
         progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
 
         progress.handle_event(
+            "submitted",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+            },
+        )
+        progress.handle_event(
+            "waiting_task",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+                "export_gap_total_seconds": 181,
+                "export_gap_remaining_seconds": 181,
+            },
+        )
+        progress.handle_event(
+            "waiting_export_gap",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+                "total_seconds": 181,
+                "remaining_seconds": 180,
+            },
+        )
+
+        rendered = output.getvalue()
+        self.assertNotIn("0/4", rendered)
+        self.assertIn(
+            f"submitted {format_local(5)}..{format_local(8)} task=task-5-8 | 等待文件生成 | 导出间隔 181s",
+            rendered,
+        )
+        self.assertIn(
+            f"submitted {format_local(5)}..{format_local(8)} task=task-5-8 | 等待文件生成 | 导出间隔 180s",
+            rendered,
+        )
+        self.assertNotIn("[submitted]", rendered)
+        self.assertNotIn("[waiting_export_gap]", rendered)
+
+    def test_progress_bar_hides_not_ready_poll_result_from_status_line(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
+
+        progress.handle_event(
+            "submitted",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+            },
+        )
+        progress.handle_event(
             "task_polled",
             {
                 "start_ts": 5,
@@ -104,15 +162,17 @@ class TimeProgressBarTests(unittest.TestCase):
                 "task_id": "task-5-8",
                 "requested_at_ts": 100,
                 "result_text": "文件未生成",
+                "export_gap_total_seconds": 181,
+                "export_gap_remaining_seconds": 181,
             },
         )
 
         rendered = output.getvalue()
-        self.assertNotIn("0/4", rendered)
         self.assertIn(
-            f"等待文件生成 | 最近请求 {format_local(100)} | 结果：文件未生成",
+            f"submitted {format_local(5)}..{format_local(8)} task=task-5-8 | 等待文件生成 | 导出间隔 181s",
             rendered,
         )
+        self.assertNotIn("结果：文件未生成", rendered)
         self.assertNotIn("[task_polled]", rendered)
 
     def test_progress_bar_updates_export_gap_countdown_without_extra_event_logs(self) -> None:
@@ -149,6 +209,51 @@ class TimeProgressBarTests(unittest.TestCase):
         self.assertIn("等待导出请求间隔 180s", rendered)
         self.assertNotIn("0/4", rendered)
         self.assertNotIn("[waiting_export_gap]", rendered)
+
+    def test_progress_bar_clears_old_export_gap_countdown_when_waiting_without_pending_segments(self) -> None:
+        module = self.load_module()
+        if module is None:
+            return
+
+        output = io.StringIO()
+        progress = module.TimeProgressBar(start_ts=5, end_ts=8, stream=output)
+
+        progress.handle_event(
+            "submitted",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+            },
+        )
+        progress.handle_event(
+            "waiting_task",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+                "export_gap_total_seconds": 181,
+                "export_gap_remaining_seconds": 181,
+            },
+        )
+        progress.handle_event(
+            "task_polled",
+            {
+                "start_ts": 5,
+                "end_ts": 8,
+                "task_id": "task-5-8",
+                "requested_at_ts": 100,
+                "result_text": "文件未生成",
+            },
+        )
+
+        final_status = output.getvalue().split("\r")[-1]
+        self.assertIn(
+            f"submitted {format_local(5)}..{format_local(8)} task=task-5-8 | 等待文件生成",
+            final_status,
+        )
+        self.assertNotIn("导出间隔", final_status)
+        self.assertNotIn("结果：文件未生成", final_status)
 
     def test_progress_bar_keeps_completed_ratio_when_a_later_segment_fails(self) -> None:
         module = self.load_module()
@@ -215,10 +320,8 @@ class TimeProgressBarTests(unittest.TestCase):
         progress.finish(success=True)
 
         rendered = output.getvalue()
-        self.assertIn(
-            f"[submitted] {format_local(8)}..{format_local(8)} task=task-8-8",
-            rendered,
-        )
+        self.assertIn(f"submitted {format_local(8)}..{format_local(8)} task=task-8-8", rendered)
+        self.assertNotIn("[submitted]", rendered)
         self.assertIn(
             f"[downloaded] {format_local(8)}..{format_local(8)} -> /tmp/export.csv",
             rendered,

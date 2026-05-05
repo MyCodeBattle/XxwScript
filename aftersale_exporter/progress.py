@@ -31,12 +31,6 @@ def format_progress_event(
             f"[split] {format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
             f"over limit, split at {format_local_timestamp(payload['midpoint'], timezone_name)}"
         )
-    if event_name == "submitted":
-        return (
-            f"[submitted] "
-            f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
-            f"task={payload['task_id']}"
-        )
     if event_name == "downloaded":
         return (
             f"[downloaded] "
@@ -70,6 +64,9 @@ class TimeProgressBar:
         self.completed_seconds = 0
         self.completed_ranges: set[tuple[int, int]] = set()
         self.status = "waiting"
+        self._current_task_status: str | None = None
+        self._is_waiting_for_generation = False
+        self._current_export_gap_remaining: int | None = None
         self._last_line_length = 0
         self._render()
 
@@ -101,33 +98,63 @@ class TimeProgressBar:
 
     def _build_status(self, event_name: str, payload: dict[str, Any]) -> str:
         if event_name == "split":
+            self._is_waiting_for_generation = False
+            self._current_export_gap_remaining = None
             return (
                 "splitting "
                 f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
             )
         if event_name == "submitted":
-            return f"task {payload['task_id']}"
+            self._current_task_status = self._format_submitted_status(payload)
+            self._is_waiting_for_generation = False
+            self._current_export_gap_remaining = None
+            return self._current_task_status
         if event_name == "waiting_task":
-            return "等待文件生成"
+            self._current_task_status = self._format_submitted_status(payload)
+            self._is_waiting_for_generation = True
+            self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
+            return self._compose_task_status()
         if event_name == "task_polled":
-            return (
-                "等待文件生成 | 最近请求 "
-                f"{format_local_timestamp(payload['requested_at_ts'], self.timezone_name)} | "
-                f"结果：{payload['result_text']}"
-            )
+            self._current_task_status = self._format_submitted_status(payload)
+            self._is_waiting_for_generation = True
+            self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
+            return self._compose_task_status()
         if event_name == "waiting_export_gap":
+            self._current_export_gap_remaining = payload["remaining_seconds"]
+            if self._is_waiting_for_generation and self._current_task_status is not None:
+                return self._compose_task_status()
             return f"等待导出请求间隔 {payload['remaining_seconds']}s"
         if event_name == "downloaded":
+            self._is_waiting_for_generation = False
+            self._current_export_gap_remaining = None
             return (
                 "downloaded "
                 f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
             )
         if event_name == "failed":
+            self._is_waiting_for_generation = False
+            self._current_export_gap_remaining = None
             return (
                 "failed "
                 f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)}"
             )
         return event_name
+
+    def _format_submitted_status(self, payload: dict[str, Any]) -> str:
+        return (
+            "submitted "
+            f"{format_time_range(payload['start_ts'], payload['end_ts'], self.timezone_name)} "
+            f"task={payload['task_id']}"
+        )
+
+    def _compose_task_status(self) -> str:
+        base = self._current_task_status or "waiting"
+        if not self._is_waiting_for_generation:
+            return base
+        status = f"{base} | 等待文件生成"
+        if self._current_export_gap_remaining is not None:
+            status += f" | 导出间隔 {self._current_export_gap_remaining}s"
+        return status
 
     def _write_event_log(self, event_name: str, payload: dict[str, Any]) -> None:
         message = format_progress_event(event_name, payload, timezone_name=self.timezone_name)

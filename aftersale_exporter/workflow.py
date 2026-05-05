@@ -142,7 +142,7 @@ class ExportCoordinator:
             if due_tasks:
                 due_tasks.sort(key=lambda item: (item.next_poll_at, item.start_ts, item.end_ts))
                 for task in due_tasks:
-                    ready = self._poll_active_task(task)
+                    ready = self._poll_active_task(task, pending_segments)
                     if ready is None:
                         continue
                     active_tasks.pop(task.task_id, None)
@@ -165,8 +165,6 @@ class ExportCoordinator:
         segment: PendingSegment,
         pending_segments: deque[PendingSegment],
     ) -> ActiveExportTask | None:
-        request_started_at = self.time_fn()
-        self._last_export_request_at = request_started_at
         try:
             task_id = self.service.create_export(segment.start_ts, segment.end_ts)
             self._emit(
@@ -215,6 +213,8 @@ class ExportCoordinator:
             )
             raise
 
+        submitted_at = self.time_fn()
+        self._last_export_request_at = submitted_at
         self._emit(
             "waiting_task",
             {
@@ -223,17 +223,22 @@ class ExportCoordinator:
                 "task_id": task_id,
                 "poll_interval": self.poll_interval,
                 "timeout": self.task_timeout,
+                **self._build_export_gap_payload(pending_segments, now=submitted_at),
             },
         )
         return ActiveExportTask(
             start_ts=segment.start_ts,
             end_ts=segment.end_ts,
             task_id=task_id,
-            deadline_at=request_started_at + self.task_timeout,
-            next_poll_at=request_started_at,
+            deadline_at=submitted_at + self.task_timeout,
+            next_poll_at=submitted_at,
         )
 
-    def _poll_active_task(self, task: ActiveExportTask) -> ReadyDownload | None:
+    def _poll_active_task(
+        self,
+        task: ActiveExportTask,
+        pending_segments: deque[PendingSegment],
+    ) -> ReadyDownload | None:
         try:
             poll_result = self.service.poll_task(task.task_id)
         except Exception as exc:
@@ -249,16 +254,16 @@ class ExportCoordinator:
             )
             raise
 
-        self._emit(
-            "task_polled",
-            {
-                "start_ts": task.start_ts,
-                "end_ts": task.end_ts,
-                "task_id": task.task_id,
-                "requested_at_ts": poll_result.requested_at_ts,
-                "result_text": poll_result.result_text,
-            },
-        )
+        poll_payload = {
+            "start_ts": task.start_ts,
+            "end_ts": task.end_ts,
+            "task_id": task.task_id,
+            "requested_at_ts": poll_result.requested_at_ts,
+            "result_text": poll_result.result_text,
+        }
+        if not poll_result.is_complete:
+            poll_payload.update(self._build_export_gap_payload(pending_segments))
+        self._emit("task_polled", poll_payload)
         if poll_result.is_complete:
             download_name = poll_result.download_name or f"{task.task_id}.bin"
             return ReadyDownload(
@@ -323,6 +328,36 @@ class ExportCoordinator:
             return True
         return now >= self._last_export_request_at + EXPORT_GAP_SECONDS
 
+    def _build_export_gap_payload(
+        self,
+        pending_segments: deque[PendingSegment],
+        *,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        remaining_seconds = self._get_export_gap_remaining_seconds(pending_segments, now=now)
+        if remaining_seconds is None:
+            return {}
+        return {
+            "export_gap_total_seconds": int(EXPORT_GAP_SECONDS),
+            "export_gap_remaining_seconds": remaining_seconds,
+        }
+
+    def _get_export_gap_remaining_seconds(
+        self,
+        pending_segments: deque[PendingSegment],
+        *,
+        now: float | None = None,
+    ) -> int | None:
+        if not pending_segments or self._last_export_request_at is None:
+            return None
+        current_now = self.time_fn() if now is None else now
+        remaining_seconds = int(
+            math.ceil(self._last_export_request_at + EXPORT_GAP_SECONDS - current_now)
+        )
+        if remaining_seconds <= 0:
+            return None
+        return remaining_seconds
+
     def _sleep_until_next_action(
         self,
         pending_segments: deque[PendingSegment],
@@ -340,17 +375,16 @@ class ExportCoordinator:
         if math.isinf(next_action_at):
             return
 
-        if next_submit_at < next_poll_at:
-            remaining_seconds = max(0, int(math.ceil(next_submit_at - now)))
-            if remaining_seconds > 0:
-                self._emit(
-                    "waiting_export_gap",
-                    {
-                        "total_seconds": int(EXPORT_GAP_SECONDS),
-                        "remaining_seconds": remaining_seconds,
-                    },
-                )
-            self.sleep_fn(min(1.0, max(0.0, next_submit_at - now)))
+        remaining_seconds = self._get_export_gap_remaining_seconds(pending_segments, now=now)
+        if remaining_seconds is not None:
+            self._emit(
+                "waiting_export_gap",
+                {
+                    "total_seconds": int(EXPORT_GAP_SECONDS),
+                    "remaining_seconds": remaining_seconds,
+                },
+            )
+            self.sleep_fn(min(1.0, max(0.0, next_action_at - now)))
             return
 
         sleep_seconds = max(0.0, next_action_at - now)
