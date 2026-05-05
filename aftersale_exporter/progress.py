@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 import sys
 from typing import Any, TextIO
 from zoneinfo import ZoneInfo
@@ -64,28 +65,34 @@ class TimeProgressBar:
         self.completed_seconds = 0
         self.completed_ranges: set[tuple[int, int]] = set()
         self.status = "waiting"
+        self._live_updates = self._supports_live_updates()
         self._current_task_status: str | None = None
         self._is_waiting_for_generation = False
         self._current_export_gap_remaining: int | None = None
         self._last_line_length = 0
-        self._render()
+        if self._live_updates:
+            self._render()
 
     def handle_event(self, event_name: str, payload: dict[str, Any]) -> None:
         self.status = self._build_status(event_name, payload)
         if event_name == "downloaded":
             self._mark_completed(payload["start_ts"], payload["end_ts"])
-        self._write_event_log(event_name, payload)
-        self._render()
+        if self._live_updates:
+            self._write_event_log(event_name, payload)
+            self._render()
+            return
+        self._write_plain_output(event_name, payload)
 
     def finish(self, *, success: bool) -> None:
-        if success:
-            self.completed_seconds = self.total_seconds
-            self.status = "completed"
-        elif self.status == "waiting":
-            self.status = "failed"
-        self._render()
-        self.stream.write("\n")
-        self._flush()
+        if self._live_updates:
+            if success:
+                self.completed_seconds = self.total_seconds
+                self.status = "completed"
+            elif self.status == "waiting":
+                self.status = "failed"
+            self._render()
+            self.stream.write("\n")
+            self._flush()
 
     def _mark_completed(self, start_ts: int, end_ts: int) -> None:
         key = (start_ts, end_ts)
@@ -113,13 +120,15 @@ class TimeProgressBar:
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = True
             self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
-            return self._compose_task_status()
+            return self._compose_task_status(include_export_gap=self._live_updates)
         if event_name == "task_polled":
             self._current_task_status = self._format_submitted_status(payload)
             self._is_waiting_for_generation = True
             self._current_export_gap_remaining = payload.get("export_gap_remaining_seconds")
-            return self._compose_task_status()
+            return self._compose_task_status(include_export_gap=self._live_updates)
         if event_name == "waiting_export_gap":
+            if not self._live_updates:
+                return self.status
             self._current_export_gap_remaining = payload["remaining_seconds"]
             if self._is_waiting_for_generation and self._current_task_status is not None:
                 return self._compose_task_status()
@@ -147,14 +156,36 @@ class TimeProgressBar:
             f"task={payload['task_id']}"
         )
 
-    def _compose_task_status(self) -> str:
+    def _compose_task_status(self, *, include_export_gap: bool = True) -> str:
         base = self._current_task_status or "waiting"
         if not self._is_waiting_for_generation:
             return base
         status = f"{base} | 等待文件生成"
-        if self._current_export_gap_remaining is not None:
+        if include_export_gap and self._current_export_gap_remaining is not None:
             status += f" | 导出间隔 {self._current_export_gap_remaining}s"
         return status
+
+    def _supports_live_updates(self) -> bool:
+        isatty = getattr(self.stream, "isatty", None)
+        if not callable(isatty) or not isatty():
+            return False
+        return os.environ.get("TERM") != "dumb"
+
+    def _write_plain_output(self, event_name: str, payload: dict[str, Any]) -> None:
+        if event_name == "submitted":
+            self.stream.write(f"{self._format_submitted_status(payload)}\n")
+            self._flush()
+            return
+        if event_name == "waiting_task":
+            self.stream.write(f"{self._compose_task_status(include_export_gap=False)}\n")
+            self._flush()
+            return
+        if event_name in {"split", "downloaded", "failed"}:
+            message = format_progress_event(event_name, payload, timezone_name=self.timezone_name)
+            if message is None:
+                return
+            self.stream.write(f"{message}\n")
+            self._flush()
 
     def _write_event_log(self, event_name: str, payload: dict[str, Any]) -> None:
         message = format_progress_event(event_name, payload, timezone_name=self.timezone_name)
