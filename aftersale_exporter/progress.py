@@ -68,6 +68,27 @@ def format_progress_event(
             f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)} "
             f"{payload['error_type']}: {payload['message']}"
         )
+    if event_name == "remediation":
+        state = payload.get("state")
+        date = payload.get("date", "")
+        if state == "downloading":
+            return (
+                f"[remediation] {date} re-downloading "
+                f"{format_time_range(payload['start_ts'], payload['end_ts'], timezone_name)}"
+            )
+        if state == "resolved":
+            return (
+                f"[remediation] {date} "
+                f"manifest={payload['manifest_total']} "
+                f"merged={payload['merged_total']} | RESOLVED"
+            )
+        if state == "unresolved":
+            return (
+                f"[remediation] {date} "
+                f"manifest={payload['manifest_total']} "
+                f"merged={payload['merged_total']} | UNRESOLVED"
+            )
+        return None
     return None
 
 
@@ -244,6 +265,7 @@ class TimeProgressBar:
             "retrying_task_timeout",
             "counted",
             "count_failed",
+            "remediation",
         }:
             message = format_progress_event(event_name, payload, timezone_name=self.timezone_name)
             if message is None:

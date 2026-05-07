@@ -204,6 +204,59 @@ class DailyCountFakeService(MixedFormatFakeService):
         return self.count_totals[key]
 
 
+class RemediationFakeService:
+    """Fake service that returns different export data on second call for same range."""
+
+    def __init__(
+        self,
+        *,
+        count_totals: dict[tuple[int, int], int],
+        first_export_rows: dict[str, list[tuple[str, str, str]]],
+        second_export_rows: dict[str, list[tuple[str, str, str]]] | None = None,
+    ) -> None:
+        self.count_totals = count_totals
+        self.count_requests: list[tuple[int, int]] = []
+        self.submissions: list[tuple[int, int]] = []
+        self.first_export_rows = first_export_rows
+        self.second_export_rows = second_export_rows or {}
+        self._export_call_counts: dict[tuple[int, int], int] = {}
+
+    def create_export(self, start_ts: int, end_ts: int) -> str:
+        self.submissions.append((start_ts, end_ts))
+        return f"task-{start_ts}-{end_ts}"
+
+    def wait_for_task(self, task_id, poll_interval, timeout, status_callback=None):
+        raise AssertionError("job workflow should poll tasks incrementally")
+
+    def poll_task(self, task_id: str) -> TaskPollResult:
+        return TaskPollResult(
+            requested_at_ts=1234567890,
+            result_text="文件已生成",
+            is_complete=True,
+            download_name=f"{task_id}.csv",
+        )
+
+    def download_export(self, task_id: str, destination: Path) -> Path:
+        key = tuple(int(x) for x in task_id.replace("task-", "").split("-"))
+        call_index = self._export_call_counts.get(key, 0)
+        self._export_call_counts[key] = call_index + 1
+
+        rows_map = self.first_export_rows if call_index == 0 else self.second_export_rows
+        rows = rows_map.get(task_id)
+        if rows is None:
+            rows = next(iter(rows_map.values()))
+        lines = ["售后单号,售后完结时间,value"]
+        for order_no, finished_at, value in rows:
+            lines.append(f"{order_no},{finished_at},{value}")
+        destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return destination
+
+    def count_aftersales(self, start_ts: int, end_ts: int) -> int:
+        key = (start_ts, end_ts)
+        self.count_requests.append(key)
+        return self.count_totals[key]
+
+
 def load_latest_manifest_snapshot(manifest_path: Path) -> dict[str, object]:
     manifest_text = manifest_path.read_text(encoding="utf-8")
     marker_index = manifest_text.rfind(MANIFEST_RUN_SEPARATOR_PREFIX)
@@ -350,8 +403,9 @@ class AftersaleExportJobTests(unittest.TestCase):
         self.assertIn("waiting_task", events)
         self.assertIn("task_polled", events)
         self.assertIn("waiting_export_gap", events)
-        self.assertEqual(events.count("downloaded"), 2)
-        self.assertEqual(events[-1], "counted")
+        self.assertEqual(events.count("downloaded"), 4)
+        self.assertIn("remediation", events)
+        self.assertIn("counted", events)
 
     def test_job_records_daily_counts_across_multiple_local_days(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -553,6 +607,172 @@ class AftersaleExportJobTests(unittest.TestCase):
         self.assertIn(MANIFEST_RUN_SEPARATOR_PREFIX, manifest_text)
         self.assertEqual(latest_manifest["summary"]["segment_count"], 1)
         self.assertEqual(latest_manifest["segments"][0]["start_ts"], 1)
+
+    def test_remediation_resolves_single_day_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            start_ts = local_ts("2026-05-01 00:00:00")
+            end_ts = local_ts("2026-05-01 23:59:59")
+            service = RemediationFakeService(
+                count_totals={(start_ts, end_ts): 3},
+                first_export_rows={
+                    f"task-{start_ts}-{end_ts}": [
+                        ("A1", "2026-05-01 09:00:00", "v1"),
+                    ]
+                },
+                second_export_rows={
+                    f"task-{start_ts}-{end_ts}": [
+                        ("A2", "2026-05-01 10:00:00", "v2"),
+                        ("A3", "2026-05-01 11:00:00", "v3"),
+                    ]
+                },
+            )
+            job = AftersaleExportJob(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+                timezone_name="Asia/Shanghai",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                job.run(start_ts=start_ts, end_ts=end_ts)
+
+            output = stdout.getvalue()
+            self.assertIn(
+                "2026-05-01 | manifest=3 | merged=1 | MISMATCH", output
+            )
+            self.assertIn("开始修复 1 天 mismatch", output)
+            self.assertIn("RESOLVED", output)
+            self.assertIn(
+                "修复汇总 | 共 1 天 mismatch | resolved=1 | unresolved=0", output
+            )
+            self.assertNotIn("UNRESOLVED", output)
+
+            manifest = json.loads(
+                (Path(tmpdir) / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(manifest["summary"]["remediation"]["attempted"])
+            self.assertEqual(
+                manifest["summary"]["remediation"]["resolved_count"], 1
+            )
+            self.assertEqual(
+                manifest["summary"]["remediation"]["unresolved_count"], 0
+            )
+
+    def test_remediation_unresolved_when_redownload_yields_same_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            start_ts = local_ts("2026-05-01 00:00:00")
+            end_ts = local_ts("2026-05-01 23:59:59")
+            rows = [("A1", "2026-05-01 09:00:00", "v1")]
+            service = RemediationFakeService(
+                count_totals={(start_ts, end_ts): 3},
+                first_export_rows={f"task-{start_ts}-{end_ts}": rows},
+                second_export_rows={f"task-{start_ts}-{end_ts}": rows},
+            )
+            job = AftersaleExportJob(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+                timezone_name="Asia/Shanghai",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                job.run(start_ts=start_ts, end_ts=end_ts)
+
+            output = stdout.getvalue()
+            self.assertIn("UNRESOLVED", output)
+            self.assertIn("resolved=0 | unresolved=1", output)
+
+            manifest = json.loads(
+                (Path(tmpdir) / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(manifest["summary"]["remediation"]["attempted"])
+            self.assertEqual(
+                manifest["summary"]["remediation"]["unresolved_count"], 1
+            )
+
+    def test_no_remediation_when_all_days_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            start_ts = local_ts("2026-05-01 00:00:00")
+            end_ts = local_ts("2026-05-01 23:59:59")
+            service = DailyCountFakeService(
+                count_totals={(start_ts, end_ts): 2},
+                export_rows={
+                    f"task-{start_ts}-{end_ts}": [
+                        ("A1", "2026-05-01 09:00:00", "v1"),
+                        ("A2", "2026-05-01 10:00:00", "v2"),
+                    ]
+                },
+            )
+            job = AftersaleExportJob(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+                timezone_name="Asia/Shanghai",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                job.run(start_ts=start_ts, end_ts=end_ts)
+
+            output = stdout.getvalue()
+            self.assertIn("MATCH", output)
+            self.assertNotIn("开始修复", output)
+
+            manifest = json.loads(
+                (Path(tmpdir) / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(manifest["summary"]["remediation"]["attempted"])
+
+    def test_skipped_days_not_in_remediation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = FakeClock()
+            first_start = local_ts("2026-05-01 08:00:00")
+            first_end = local_ts("2026-05-01 23:59:59")
+            second_start = local_ts("2026-05-02 00:00:00")
+            second_end = local_ts("2026-05-02 08:00:00")
+            service = DailyCountFakeService(
+                count_totals={(first_start, first_end): 1},
+                count_failures={
+                    (second_start, second_end): RuntimeError("boom")
+                },
+                export_rows={
+                    f"task-{first_start}-{second_end}": [
+                        ("A1", "2026-05-01 12:00:00", "v1"),
+                        ("A2", "2026-05-02 02:00:00", "v2"),
+                    ]
+                },
+            )
+            job = AftersaleExportJob(
+                service=service,
+                out_dir=Path(tmpdir),
+                poll_interval=0.01,
+                task_timeout=1.0,
+                sleep_fn=clock.sleep,
+                time_fn=clock.monotonic,
+                timezone_name="Asia/Shanghai",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                job.run(start_ts=first_start, end_ts=second_end)
+
+            output = stdout.getvalue()
+            self.assertIn("SKIPPED", output)
+            self.assertNotIn("开始修复", output)
 
 
 if __name__ == "__main__":

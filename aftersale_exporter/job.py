@@ -26,6 +26,13 @@ class ManifestTracker:
             "failed_count": 0,
             "daily_count_days": 0,
             "daily_count_failed_days": 0,
+            "remediation": {
+                "attempted": False,
+                "resolved_dates": [],
+                "unresolved_dates": [],
+                "resolved_count": 0,
+                "unresolved_count": 0,
+            },
         }
         self.segments: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
@@ -91,6 +98,16 @@ class ManifestTracker:
                 }
             )
             daily_count.pop("total", None)
+        elif event_name == "remediation":
+            state = payload.get("state")
+            if state == "completed":
+                self.summary["remediation"] = {
+                    "attempted": True,
+                    "resolved_dates": payload.get("resolved_dates", []),
+                    "unresolved_dates": payload.get("unresolved_dates", []),
+                    "resolved_count": payload.get("resolved_count", 0),
+                    "unresolved_count": payload.get("unresolved_count", 0),
+                }
         self.summary["segment_count"] = len(self.segments)
         self.summary["daily_count_days"] = len(self.daily_counts)
         self.summary["daily_count_failed_days"] = sum(
@@ -234,7 +251,17 @@ class AftersaleExportJob:
                 raise
 
             if merge_summary is not None:
-                self._print_merge_comparison(tracker.daily_counts, merge_summary)
+                mismatched_dates = self._print_merge_comparison(
+                    tracker.daily_counts, merge_summary
+                )
+                if mismatched_dates:
+                    self._remediate_mismatches(
+                        tracker=tracker,
+                        coordinator=coordinator,
+                        merge_summary=merge_summary,
+                        mismatched_dates=mismatched_dates,
+                        daily_counts=tracker.daily_counts,
+                    )
 
             tracker.finalize(result, merge_error=merge_error)
         finally:
@@ -282,12 +309,13 @@ class AftersaleExportJob:
         self,
         daily_counts: list[dict[str, Any]],
         merge_summary: MergeSummary,
-    ) -> None:
+    ) -> list[str]:
         manifest_by_date = {item["date"]: item for item in daily_counts}
         all_dates = sorted(set(manifest_by_date) | set(merge_summary.daily_counts))
         matched_days = 0
         mismatched_days = 0
         skipped_days = 0
+        mismatched_dates: list[str] = []
 
         for current_date in all_dates:
             manifest_item = manifest_by_date.get(current_date)
@@ -305,6 +333,8 @@ class AftersaleExportJob:
 
             mismatched_days += 1
             print(f"{current_date} | manifest={manifest_total} | merged={merged_total} | MISMATCH")
+            if manifest_item is not None and manifest_item.get("status") == "counted":
+                mismatched_dates.append(current_date)
 
         print(
             "去重汇总 | "
@@ -317,6 +347,134 @@ class AftersaleExportJob:
             f"match={matched_days} | "
             f"mismatch={mismatched_days} | "
             f"skipped={skipped_days}"
+        )
+        return mismatched_dates
+
+    def _remediate_mismatches(
+        self,
+        *,
+        tracker: ManifestTracker,
+        coordinator: ExportCoordinator,
+        merge_summary: MergeSummary,
+        mismatched_dates: list[str],
+        daily_counts: list[dict[str, Any]],
+    ) -> None:
+        daily_counts_by_date = {item["date"]: item for item in daily_counts}
+        resolved_dates: list[str] = []
+        unresolved_dates: list[str] = []
+        merged_path = self.out_dir / "merged.xlsx"
+
+        print(f"\n===== 开始修复 {len(mismatched_dates)} 天 mismatch =====")
+
+        for date_str in mismatched_dates:
+            daily_count = daily_counts_by_date.get(date_str)
+            if daily_count is None or daily_count.get("status") != "counted":
+                print(f"{date_str} | SKIP (无有效 API 查询数量)")
+                unresolved_dates.append(date_str)
+                continue
+
+            day_start_ts = daily_count["start_ts"]
+            day_end_ts = daily_count["end_ts"]
+            manifest_total = int(daily_count["total"])
+            merged_before = merge_summary.daily_counts.get(date_str, 0)
+
+            print(
+                f"\n[remediation] {date_str} | manifest={manifest_total} "
+                f"| merged={merged_before} | 重新下载..."
+            )
+
+            self._emit_event(
+                "remediation",
+                {
+                    "state": "downloading",
+                    "date": date_str,
+                    "start_ts": day_start_ts,
+                    "end_ts": day_end_ts,
+                },
+            )
+
+            try:
+                day_result = coordinator.run(day_start_ts, day_end_ts)
+            except Exception as exc:
+                print(
+                    f"[remediation] {date_str} | 下载失败: "
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+                unresolved_dates.append(date_str)
+                continue
+
+            if not day_result.segments:
+                print(f"[remediation] {date_str} | 重下载无数据返回")
+                unresolved_dates.append(date_str)
+                continue
+
+            input_files = [merged_path] + [
+                seg.file_path for seg in day_result.segments
+            ]
+            try:
+                merge_summary = merge_tabular_exports(
+                    input_files,
+                    merged_path,
+                    timezone_name=self.timezone_name,
+                )
+            except Exception as exc:
+                print(
+                    f"[remediation] {date_str} | 合并失败: "
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+                unresolved_dates.append(date_str)
+                continue
+
+            new_merged_total = merge_summary.daily_counts.get(date_str, 0)
+
+            if manifest_total == new_merged_total:
+                resolved_dates.append(date_str)
+                self._emit_event(
+                    "remediation",
+                    {
+                        "state": "resolved",
+                        "date": date_str,
+                        "manifest_total": manifest_total,
+                        "merged_total": new_merged_total,
+                    },
+                )
+                print(
+                    f"[remediation] {date_str} | manifest={manifest_total} "
+                    f"| merged={new_merged_total} | RESOLVED"
+                )
+            else:
+                unresolved_dates.append(date_str)
+                self._emit_event(
+                    "remediation",
+                    {
+                        "state": "unresolved",
+                        "date": date_str,
+                        "manifest_total": manifest_total,
+                        "merged_total": new_merged_total,
+                    },
+                )
+                print(
+                    f"[remediation] {date_str} | manifest={manifest_total} "
+                    f"| merged={new_merged_total} | UNRESOLVED"
+                )
+
+        print(
+            f"\n修复汇总 | 共 {len(mismatched_dates)} 天 mismatch "
+            f"| resolved={len(resolved_dates)} "
+            f"| unresolved={len(unresolved_dates)}"
+        )
+        if unresolved_dates:
+            print(f"  [UNRESOLVED] {', '.join(unresolved_dates)}")
+
+        self._emit_event(
+            "remediation",
+            {
+                "state": "completed",
+                "resolved_dates": resolved_dates,
+                "unresolved_dates": unresolved_dates,
+                "resolved_count": len(resolved_dates),
+                "unresolved_count": len(unresolved_dates),
+            },
         )
 
 
