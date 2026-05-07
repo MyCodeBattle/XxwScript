@@ -31,6 +31,14 @@ class ExportCooldownError(ExportError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class RetryableError(ExportError):
+    """Raised for unrecognized business errors that should be retried."""
+
+    def __init__(self, message: str, *, retry_after_seconds: int = 30) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 @dataclass(frozen=True)
 class TaskResult:
     download_name: str
@@ -243,6 +251,20 @@ class ExportCoordinator:
                 },
             )
             return None
+        except RetryableError as exc:
+            retry_started_at = self.time_fn()
+            self._export_cooldown_until = retry_started_at + exc.retry_after_seconds
+            pending_segments.appendleft(segment)
+            self._emit(
+                "waiting_retry_cooldown",
+                {
+                    "start_ts": segment.start_ts,
+                    "end_ts": segment.end_ts,
+                    "remaining_seconds": exc.retry_after_seconds,
+                    "message": str(exc),
+                },
+            )
+            return None
         except Exception as exc:
             self._emit(
                 "failed",
@@ -284,6 +306,21 @@ class ExportCoordinator:
     ) -> TaskPollOutcome:
         try:
             poll_result = self.service.poll_task(task.task_id)
+        except RetryableError as exc:
+            self._emit(
+                "retrying_task_timeout",
+                {
+                    "start_ts": task.start_ts,
+                    "end_ts": task.end_ts,
+                    "task_id": task.task_id,
+                    "retry_attempt": 1,
+                    "max_retries": TASK_TIMEOUT_RETRY_LIMIT,
+                    "message": str(exc),
+                },
+            )
+            return TaskPollOutcome(
+                retry_segment=PendingSegment(task.start_ts, task.end_ts)
+            )
         except Exception as exc:
             self._emit(
                 "failed",

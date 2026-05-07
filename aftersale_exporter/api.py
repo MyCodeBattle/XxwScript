@@ -22,6 +22,7 @@ from aftersale_exporter.workflow import (
     ExportCooldownError,
     EXPORT_GAP_SECONDS,
     OverLimitError,
+    RetryableError,
     TaskPollResult,
     TaskResult,
 )
@@ -166,7 +167,7 @@ def _raise_for_business_error(payload: dict[str, Any]) -> None:
         raise OverLimitError(message)
     if int(code) == 20309001 and "3分钟内不允许再次导出" in message:
         raise ExportCooldownError(message, retry_after_seconds=int(EXPORT_GAP_SECONDS))
-    raise RequestFailedError(message)
+    raise RetryableError(message)
 
 
 def _request_exception_types() -> tuple[type[Exception], ...]:
