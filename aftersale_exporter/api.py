@@ -212,9 +212,9 @@ def _extract_task(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
 def _extract_total(payload: dict[str, Any]) -> int:
     total = payload.get("total")
     if total is None:
-        raise RequestFailedError("response does not include total")
+        raise RetryableError("response does not include total")
     if not isinstance(total, int):
-        raise RequestFailedError("response total is not an integer")
+        raise RetryableError("response total is not an integer")
     return total
 
 

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from aftersale_exporter.api import AftersaleApiService, RequestFailedError, TaskTimeoutError
+from aftersale_exporter.workflow import RetryableError
 from aftersale_exporter.curl_template import DEFAULT_EXPORT_FILTER_CONFIG, parse_seed_curl
 from aftersale_exporter.workflow import (
     AuthenticationError,
@@ -531,7 +532,7 @@ class AftersaleApiServiceTests(unittest.TestCase):
             [FakeResponse(json_data={"code": 0, "data": {"items": []}})]
         )
 
-        with self.assertRaisesRegex(RequestFailedError, "total"):
+        with self.assertRaisesRegex(RetryableError, "total"):
             service.count_aftersales(111, 222)
 
     def test_count_aftersales_rejects_non_integer_total(self) -> None:
@@ -539,7 +540,7 @@ class AftersaleApiServiceTests(unittest.TestCase):
             [FakeResponse(json_data={"code": 0, "total": "oops", "data": {"items": []}})]
         )
 
-        with self.assertRaisesRegex(RequestFailedError, "total"):
+        with self.assertRaisesRegex(RetryableError, "total"):
             service.count_aftersales(111, 222)
 
 
