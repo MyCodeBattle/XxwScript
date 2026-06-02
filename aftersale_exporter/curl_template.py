@@ -22,6 +22,16 @@ QUERY_WHITELIST = (
     "verifyFp",
     "fp",
 )
+REQUIRED_QUERY_FIELDS = (
+    "appid",
+    "_bid",
+    "aid",
+    "aftersale_platform_source",
+    "msToken",
+    "a_bogus",
+    "verifyFp",
+    "fp",
+)
 LIST_BODY_QUERY_FIELDS = (
     "appid",
     "__token",
@@ -213,7 +223,7 @@ def parse_seed_curl(command: str) -> SessionSeed:
 
     raw_query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query = {name: raw_query[name] for name in QUERY_WHITELIST if name in raw_query}
-    missing = [name for name in QUERY_WHITELIST if name not in query]
+    missing = [name for name in REQUIRED_QUERY_FIELDS if name not in query]
     if missing:
         raise ValueError(f"missing required query fields: {', '.join(missing)}")
 

@@ -20,6 +20,14 @@ curl 'https://fxg.jinritemai.com/ffa/maftersale/aftersale/list?appid=1&__token=a
   -b 'ttwid=ttwid-value'
 """
 
+SEED_CURL_WITHOUT_TOKEN = r"""
+curl 'https://fxg.jinritemai.com/shopuser/aftersale/export?appid=1&_bid=ffa_aftersale&aid=4272&aftersale_platform_source=fxg&_lid=oldlid&verifyFp=verify-seed&fp=verify-seed&msToken=seed-token&a_bogus=seed-bogus' \
+  -H 'accept: application/json, text/plain, */*' \
+  -H 'content-type: application/json' \
+  -b 'sessionid=abc123; sid_guard=guard456' \
+  --data-raw '{"order_by":["status_deadline asc"],"final_time_start":1777564800,"final_time_end":1780243199}'
+"""
+
 class SeedCurlTests(unittest.TestCase):
     def test_parse_seed_curl_extracts_whitelisted_query_and_normalized_cookies(self) -> None:
         seed = parse_seed_curl(SEED_CURL)
@@ -50,6 +58,44 @@ class SeedCurlTests(unittest.TestCase):
                 "ttwid": "ttwid-value",
             },
         )
+
+    def test_parse_seed_curl_allows_new_export_curl_without_token(self) -> None:
+        seed = parse_seed_curl(SEED_CURL_WITHOUT_TOKEN)
+
+        self.assertEqual(seed.origin, "https://fxg.jinritemai.com")
+        self.assertEqual(
+            seed.query,
+            {
+                "appid": "1",
+                "_bid": "ffa_aftersale",
+                "aid": "4272",
+                "aftersale_platform_source": "fxg",
+                "msToken": "seed-token",
+                "a_bogus": "seed-bogus",
+                "verifyFp": "verify-seed",
+                "fp": "verify-seed",
+            },
+        )
+        self.assertEqual(seed.headers["content-type"], "application/json")
+        self.assertEqual(
+            seed.cookies,
+            {
+                "sessionid": "abc123",
+                "sid_guard": "guard456",
+            },
+        )
+
+        export_request = seed.build_export_request(
+            filter_config=DEFAULT_EXPORT_FILTER_CONFIG,
+            start_ts=111,
+            end_ts=222,
+            request_lid="newlid",
+        )
+
+        self.assertNotIn("__token", export_request.params)
+        self.assertEqual(export_request.params["_lid"], "newlid")
+        self.assertEqual(export_request.json["final_time_start"], 111)
+        self.assertEqual(export_request.json["final_time_end"], 222)
 
     def test_parse_seed_curl_rejects_non_fxg_domain(self) -> None:
         with self.assertRaisesRegex(ValueError, "fxg.jinritemai.com"):
